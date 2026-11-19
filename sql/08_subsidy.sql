@@ -29,8 +29,7 @@ BEGIN
         HourlyRate decimal(10, 2) NOT NULL,
         MaxPerOrder decimal(10, 2) NOT NULL,
         CONSTRAINT CK_SubsidyPolicy_Dates CHECK (ValidThrough >= ValidFrom),
-        CONSTRAINT CK_SubsidyPolicy_Rates CHECK (HourlyRate > 0 AND MaxPerOrder > 0),
-        CONSTRAINT UQ_SubsidyPolicy_Start UNIQUE (District, ServiceTypeId, ValidFrom)
+        CONSTRAINT CK_SubsidyPolicy_Rates CHECK (HourlyRate > 0 AND MaxPerOrder > 0)
     );
 END;
 
@@ -132,6 +131,38 @@ BEGIN
     );
 END;
 
+IF COL_LENGTH(N'dbo.SubsidyPolicy', N'BeneficiaryCategory') IS NULL
+    ALTER TABLE dbo.SubsidyPolicy ADD BeneficiaryCategory varchar(12) NOT NULL
+        CONSTRAINT DF_SubsidyPolicy_Category DEFAULT 'ANY',
+        AbilityLevel nvarchar(20) NOT NULL CONSTRAINT DF_SubsidyPolicy_Level DEFAULT N'通用',
+        CONSTRAINT CK_SubsidyPolicy_Category CHECK (BeneficiaryCategory IN ('ANY','GENERAL','LOW_INCOME')),
+        CONSTRAINT CK_SubsidyPolicy_Level CHECK (AbilityLevel IN (
+            N'通用',N'能力完好',N'轻度失能',N'中度失能',N'重度失能',N'完全失能'
+        ));
+
+IF OBJECT_ID(N'dbo.UQ_SubsidyPolicy_Start', N'UQ') IS NOT NULL
+    ALTER TABLE dbo.SubsidyPolicy DROP CONSTRAINT UQ_SubsidyPolicy_Start;
+IF OBJECT_ID(N'dbo.UQ_SubsidyPolicy_BasisStart', N'UQ') IS NULL
+    EXEC(N'ALTER TABLE dbo.SubsidyPolicy ADD CONSTRAINT UQ_SubsidyPolicy_BasisStart
+        UNIQUE (District, ServiceTypeId, BeneficiaryCategory, AbilityLevel, ValidFrom);');
+
+IF COL_LENGTH(N'dbo.SubsidyClaimOrder', N'SubsidyCategory') IS NULL
+    ALTER TABLE dbo.SubsidyClaimOrder ADD SubsidyCategory varchar(12) NULL, SubsidyAbilityLevel nvarchar(20) NULL;
+
+IF COL_LENGTH(N'dbo.ServiceInspection', N'InspectionMethod') IS NULL
+    ALTER TABLE dbo.ServiceInspection ADD InspectionMethod varchar(10) NULL, IssueTag nvarchar(60) NULL,
+        CONSTRAINT CK_ServiceInspection_Method CHECK (InspectionMethod IN ('PHONE','VISIT'));
+
+IF COL_LENGTH(N'dbo.ServiceInspection', N'CorrectionRequirement') IS NULL
+    ALTER TABLE dbo.ServiceInspection ADD CorrectionRequirement nvarchar(250) NULL;
+IF COL_LENGTH(N'dbo.SubsidyClaimLog', N'EvidenceSnapshot') IS NULL
+    ALTER TABLE dbo.SubsidyClaimLog ADD EvidenceSnapshot nvarchar(max) NULL,
+        CONSTRAINT CK_SubsidyClaimLog_Evidence CHECK (ISJSON(EvidenceSnapshot, ARRAY) = 1);
+IF COL_LENGTH(N'dbo.SubsidyPolicy', N'SettlementCycle') IS NULL
+    ALTER TABLE dbo.SubsidyPolicy ADD SettlementCycle varchar(8) NOT NULL
+        CONSTRAINT DF_SubsidyPolicy_Cycle DEFAULT 'MONTH',
+        CONSTRAINT CK_SubsidyPolicy_Cycle CHECK (SettlementCycle='MONTH');
+
 COMMIT TRANSACTION;
 GO
 
@@ -140,13 +171,27 @@ AFTER INSERT, UPDATE AS
 BEGIN
     SET NOCOUNT ON;
     INSERT dbo.SubsidyClaimLog (
-        ClaimId, PreviousStatus, CurrentStatus, ActorId, Note, TotalAmount, OrderSnapshot
+        ClaimId, PreviousStatus, CurrentStatus, ActorId, Note, TotalAmount, OrderSnapshot, EvidenceSnapshot
     )
     SELECT new.ClaimId, old.Status, new.Status, new.ChangedBy, new.ChangeNote, new.TotalAmount,
            (SELECT line.OrderId, line.PolicyId, line.EffectiveMinutes, line.OrderPrice,
-                   line.HourlyRate, line.MaxPerOrder, line.Amount, line.ServiceCompletedAt, line.ConfirmedAt
+                    line.HourlyRate, line.MaxPerOrder, line.Amount, line.ServiceCompletedAt, line.ConfirmedAt,
+                    line.SubsidyCategory, line.SubsidyAbilityLevel
             FROM dbo.SubsidyClaimOrder line
-            WHERE line.ClaimId = new.ClaimId ORDER BY line.OrderId FOR JSON PATH)
+            WHERE line.ClaimId = new.ClaimId ORDER BY line.OrderId FOR JSON PATH),
+           CASE WHEN new.Status='STREET' THEN (
+               SELECT line.OrderId, orders.OrderNo, visit.ServiceRecord, visit.CheckInAt,
+                      line.ServiceCompletedAt AS CheckOutAt, line.EffectiveMinutes, line.ConfirmedAt,
+                      visit.ConfirmedBy, signer.Role AS SignerRole,
+                      CONVERT(varchar(64), visit.ConfirmationHash, 2) AS ConfirmationHash,
+                      line.PolicyId, line.SubsidyCategory, line.SubsidyAbilityLevel,
+                      line.HourlyRate, line.MaxPerOrder, line.OrderPrice, line.Amount
+               FROM dbo.SubsidyClaimOrder line
+               JOIN dbo.ServiceOrder orders ON orders.OrderId=line.OrderId
+               JOIN dbo.ServiceVisit visit ON visit.OrderId=line.OrderId
+               LEFT JOIN dbo.AppUser signer ON signer.UserId=visit.ConfirmedBy
+               WHERE line.ClaimId=new.ClaimId ORDER BY line.OrderId FOR JSON PATH, INCLUDE_NULL_VALUES
+           ) END
     FROM inserted new
     LEFT JOIN deleted old ON old.ClaimId = new.ClaimId
     WHERE (old.ClaimId IS NULL AND new.Status <> 'DRAFT') OR old.Status <> new.Status;
@@ -180,20 +225,56 @@ GO
 CREATE OR ALTER VIEW dbo.v_SubsidyClaimTrace AS
 SELECT line.ClaimId, line.OrderId, claim.ArchiveNo, claim.ServiceTypeId,
        line.PolicyId, policy.PolicyName, line.ServiceCompletedAt, line.ConfirmedAt,
-       line.EffectiveMinutes, line.OrderPrice, line.HourlyRate, line.MaxPerOrder, line.Amount
+       line.EffectiveMinutes, line.OrderPrice, line.HourlyRate, line.MaxPerOrder, line.Amount,
+       line.SubsidyCategory, line.SubsidyAbilityLevel
 FROM dbo.SubsidyClaimOrder line
 JOIN dbo.SubsidyClaim claim ON claim.ClaimId = line.ClaimId
 JOIN dbo.SubsidyPolicy policy ON policy.PolicyId = line.PolicyId;
+GO
+
+CREATE OR ALTER VIEW dbo.v_SubsidyApplicableOrder AS
+SELECT visit.*, dates.PeriodMonth, policy.PolicyId, policy.HourlyRate, policy.MaxPerOrder, calculation.Amount
+FROM dbo.v_SubsidyEligibleOrder visit
+JOIN dbo.Community community ON community.CommunityId = visit.CommunityId
+CROSS APPLY (VALUES (CONVERT(date, DATEADD(hour, 8, visit.CheckOutAt)))) clock(ServiceDate)
+CROSS APPLY (VALUES (DATEFROMPARTS(YEAR(clock.ServiceDate), MONTH(clock.ServiceDate), 1))) dates(PeriodMonth)
+CROSS APPLY (
+    SELECT TOP (1) candidate.PolicyId, candidate.HourlyRate, candidate.MaxPerOrder
+    FROM dbo.SubsidyPolicy candidate
+    WHERE candidate.District = community.District AND candidate.ServiceTypeId = visit.ServiceTypeId
+      AND clock.ServiceDate BETWEEN candidate.ValidFrom AND candidate.ValidThrough
+      AND (candidate.BeneficiaryCategory = 'ANY' OR candidate.BeneficiaryCategory = visit.SubsidyCategory)
+      AND (candidate.AbilityLevel = N'通用' OR candidate.AbilityLevel = visit.SubsidyAbilityLevel)
+    ORDER BY IIF(candidate.BeneficiaryCategory = 'ANY', 0, 1) DESC,
+             IIF(candidate.AbilityLevel = N'通用', 0, 1) DESC, candidate.ValidFrom DESC, candidate.PolicyId DESC
+) policy
+CROSS APPLY (
+    SELECT MIN(value) AS Amount
+    FROM (VALUES (CONVERT(decimal(14, 2), policy.HourlyRate * visit.EffectiveMinutes / 60.0)),
+                 (visit.Price), (policy.MaxPerOrder)) amounts(value)
+) calculation;
 GO
 
 CREATE OR ALTER VIEW dbo.v_QualityInspectionSummary AS
 SELECT inspection.InspectionId, inspection.OrderId, inspection.WorkerId, worker.Name AS WorkerName,
        agency.AgencyId, agency.Name AS AgencyName, inspection.ReviewDistrict,
        inspection.Score, inspection.Finding, inspection.Status, inspection.InspectedAt,
-       inspection.Correction, inspection.CorrectedAt, inspection.ClosedAt, inspection.RestrictionId
+       inspection.Correction, inspection.CorrectedAt, inspection.ClosedAt, inspection.RestrictionId,
+       inspection.InspectionMethod, inspection.IssueTag, inspection.CorrectionRequirement
 FROM dbo.ServiceInspection inspection
 JOIN dbo.Worker worker ON worker.WorkerId = inspection.WorkerId
 JOIN dbo.Agency agency ON agency.AgencyId = worker.AgencyId;
+GO
+
+CREATE OR ALTER VIEW dbo.v_MonthlyInspectionResults AS
+SELECT CONVERT(char(7), DATEADD(hour, 8, InspectedAt), 126) AS InspectionMonth,
+       ReviewDistrict, WorkerId, WorkerName, AgencyId, AgencyName,
+       COUNT_BIG(*) AS InspectionCount, SUM(CONVERT(bigint, Score)) AS ScoreTotal,
+       COUNT_BIG(RestrictionId) AS RequiredCount,
+       COUNT_BIG(CASE WHEN RestrictionId IS NOT NULL AND Status = 'CLOSED' THEN 1 END) AS ClosedCount
+FROM dbo.v_QualityInspectionSummary
+GROUP BY CONVERT(char(7), DATEADD(hour, 8, InspectedAt), 126),
+         ReviewDistrict, WorkerId, WorkerName, AgencyId, AgencyName;
 GO
 
 CREATE OR ALTER VIEW dbo.v_DistrictServiceCoverage AS
@@ -210,7 +291,7 @@ GO
 CREATE OR ALTER PROCEDURE dbo.usp_SaveSubsidyPolicy
     @ActorId int, @PolicyName nvarchar(100), @District nvarchar(80), @ServiceTypeId int,
     @ValidFrom date, @ValidThrough date, @HourlyRate decimal(10, 2), @MaxPerOrder decimal(10, 2),
-    @ClosePrevious bit = 0
+    @ClosePrevious bit = 0, @BeneficiaryCategory varchar(12) = 'ANY', @AbilityLevel nvarchar(20) = N'通用'
 AS
 BEGIN
     SET XACT_ABORT ON;
@@ -225,6 +306,11 @@ BEGIN
         IF NULLIF(TRIM(@PolicyName), N'') IS NULL OR @ValidFrom IS NULL
            OR @ValidThrough IS NULL OR @ValidThrough < @ValidFrom
             THROW 51802, N'请填写政策名称和有效日期。', 1;
+        IF @BeneficiaryCategory IS NULL OR @BeneficiaryCategory NOT IN ('ANY','GENERAL','LOW_INCOME')
+           OR @AbilityLevel IS NULL OR @AbilityLevel NOT IN (
+               N'通用',N'能力完好',N'轻度失能',N'中度失能',N'重度失能',N'完全失能'
+           )
+            THROW 51802, N'请选择有效的适用对象及能力等级。', 1;
 
         IF @ClosePrevious = 1
         BEGIN
@@ -235,6 +321,7 @@ BEGIN
             SELECT @PreviousPolicyId = PolicyId
             FROM dbo.SubsidyPolicy WITH (UPDLOCK, HOLDLOCK)
             WHERE District = @District AND ServiceTypeId = @ServiceTypeId
+              AND BeneficiaryCategory = @BeneficiaryCategory AND AbilityLevel = @AbilityLevel
               AND ValidFrom < @ValidFrom AND ValidThrough >= @ValidFrom;
 
             IF EXISTS (
@@ -251,12 +338,15 @@ BEGIN
         IF EXISTS (
             SELECT 1 FROM dbo.SubsidyPolicy WITH (UPDLOCK, HOLDLOCK)
             WHERE District = @District AND ServiceTypeId = @ServiceTypeId
+              AND BeneficiaryCategory = @BeneficiaryCategory AND AbilityLevel = @AbilityLevel
               AND ValidFrom <= @ValidThrough AND ValidThrough >= @ValidFrom
         )
-            THROW 51803, N'同一辖区和项目的补贴政策有效期不能重叠。', 1;
+            THROW 51803, N'同一辖区、项目、对象类别和能力等级的政策有效期不能重叠。', 1;
 
-        INSERT dbo.SubsidyPolicy (PolicyName, District, ServiceTypeId, ValidFrom, ValidThrough, HourlyRate, MaxPerOrder)
-        VALUES (@PolicyName, @District, @ServiceTypeId, @ValidFrom, @ValidThrough, @HourlyRate, @MaxPerOrder);
+        INSERT dbo.SubsidyPolicy (PolicyName, District, ServiceTypeId, ValidFrom, ValidThrough, HourlyRate, MaxPerOrder,
+                                  BeneficiaryCategory, AbilityLevel)
+        VALUES (@PolicyName, @District, @ServiceTypeId, @ValidFrom, @ValidThrough, @HourlyRate, @MaxPerOrder,
+                @BeneficiaryCategory, @AbilityLevel);
         COMMIT TRANSACTION;
     END TRY
     BEGIN CATCH
@@ -301,34 +391,19 @@ BEGIN
         IF @ClaimId IS NOT NULL AND (@CurrentStatus <> 'RETURNED' OR @ExistingCommunityId <> @CommunityId)
             THROW 51807, N'同一老人、项目和月份已有申报，只有原社区可以修改退回的申报。', 1;
 
-        DECLARE @MonthStartUtc datetime2(0) = DATEADD(hour, -8, CONVERT(datetime2(0), @PeriodMonth));
-        DECLARE @NextMonthStartUtc datetime2(0) = DATEADD(hour, -8, CONVERT(datetime2(0), DATEADD(month, 1, @PeriodMonth)));
         DECLARE @Lines TABLE (
             OrderId int PRIMARY KEY, PolicyId int NOT NULL, ServiceCompletedAt datetime2(0) NOT NULL,
             ConfirmedAt datetime2(0) NOT NULL, EffectiveMinutes int NOT NULL, OrderPrice decimal(14, 2) NOT NULL,
-            HourlyRate decimal(10, 2) NOT NULL, MaxPerOrder decimal(10, 2) NOT NULL, Amount decimal(14, 2) NOT NULL
+            HourlyRate decimal(10, 2) NOT NULL, MaxPerOrder decimal(10, 2) NOT NULL, Amount decimal(14, 2) NOT NULL,
+            SubsidyCategory varchar(12) NULL, SubsidyAbilityLevel nvarchar(20) NULL
         );
         INSERT @Lines
-        SELECT visit.OrderId, policy.PolicyId, visit.CheckOutAt, visit.ConfirmedAt, visit.EffectiveMinutes,
-               visit.Price, policy.HourlyRate, policy.MaxPerOrder, calculation.Amount
+        SELECT visit.OrderId, visit.PolicyId, visit.CheckOutAt, visit.ConfirmedAt, visit.EffectiveMinutes,
+               visit.Price, visit.HourlyRate, visit.MaxPerOrder, visit.Amount, visit.SubsidyCategory, visit.SubsidyAbilityLevel
         FROM @RequestedOrders requested
-        JOIN dbo.v_SubsidyEligibleOrder visit ON visit.OrderId = requested.OrderId
-        JOIN dbo.Community community ON community.CommunityId = visit.CommunityId
-        CROSS APPLY (
-            SELECT TOP (1) candidate.PolicyId, candidate.HourlyRate, candidate.MaxPerOrder
-            FROM dbo.SubsidyPolicy candidate
-            WHERE candidate.District = community.District AND candidate.ServiceTypeId = visit.ServiceTypeId
-              AND CONVERT(date, DATEADD(hour, 8, visit.CheckOutAt)) BETWEEN candidate.ValidFrom AND candidate.ValidThrough
-            ORDER BY candidate.ValidFrom DESC
-        ) policy
-        CROSS APPLY (
-            SELECT MIN(value) AS Amount
-            FROM (VALUES (CONVERT(decimal(14, 2), policy.HourlyRate * visit.EffectiveMinutes / 60.0)),
-                         (visit.Price), (policy.MaxPerOrder)) amounts(value)
-        ) calculation
+        JOIN dbo.v_SubsidyApplicableOrder visit ON visit.OrderId = requested.OrderId
         WHERE visit.ArchiveNo = @ArchiveNo AND visit.CommunityId = @CommunityId AND visit.ServiceTypeId = @ServiceTypeId
-          AND visit.CheckOutAt >= @MonthStartUtc AND visit.CheckOutAt < @NextMonthStartUtc
-          AND visit.ConfirmedAt IS NOT NULL AND visit.EffectiveMinutes > 0
+          AND visit.PeriodMonth = @PeriodMonth
           AND NOT EXISTS (
               SELECT 1 FROM dbo.SubsidyClaimOrder existing WITH (UPDLOCK, HOLDLOCK)
               WHERE existing.OrderId = visit.OrderId AND (@ClaimId IS NULL OR existing.ClaimId <> @ClaimId)
@@ -348,10 +423,10 @@ BEGIN
 
         INSERT dbo.SubsidyClaimOrder (
             ClaimId, OrderId, PolicyId, ServiceCompletedAt, ConfirmedAt, EffectiveMinutes,
-            OrderPrice, HourlyRate, MaxPerOrder, Amount
+            OrderPrice, HourlyRate, MaxPerOrder, Amount, SubsidyCategory, SubsidyAbilityLevel
         )
         SELECT @ClaimId, OrderId, PolicyId, ServiceCompletedAt, ConfirmedAt, EffectiveMinutes,
-               OrderPrice, HourlyRate, MaxPerOrder, Amount
+               OrderPrice, HourlyRate, MaxPerOrder, Amount, SubsidyCategory, SubsidyAbilityLevel
         FROM @Lines;
 
         UPDATE dbo.SubsidyClaim
@@ -415,13 +490,19 @@ END;
 GO
 
 CREATE OR ALTER PROCEDURE dbo.usp_RegisterInspection
-    @ActorId int, @TargetType varchar(10), @TargetId int, @Score int, @Finding nvarchar(250)
+    @ActorId int, @TargetType varchar(10), @TargetId int, @Score int, @Finding nvarchar(250),
+    @InspectionMethod varchar(10), @IssueTag nvarchar(60) = NULL, @CorrectionRequirement nvarchar(250) = NULL
 AS
 BEGIN
     SET XACT_ABORT ON;
     SET NOCOUNT ON;
     IF @Score IS NULL OR @Score NOT BETWEEN 0 AND 100 OR NULLIF(TRIM(@Finding), N'') IS NULL
         THROW 51811, N'请填写 0 至 100 分的评价和检查结论。', 1;
+    IF @InspectionMethod IS NULL OR @InspectionMethod NOT IN ('PHONE','VISIT')
+        THROW 51811, N'请选择电话回访或上门核查。', 1;
+    SET @CorrectionRequirement = NULLIF(TRIM(@CorrectionRequirement), N'');
+    IF @Score < 60 AND @CorrectionRequirement IS NULL
+        THROW 51811, N'低于 60 分必须填写整改要求。', 1;
 
     BEGIN TRY
         BEGIN TRANSACTION;
@@ -450,17 +531,18 @@ BEGIN
             DECLARE @WorkerKey nvarchar(40) = CONVERT(nvarchar(40), @WorkerId);
             EXEC dbo.usp_ServiceLock 'worker', @WorkerKey;
             INSERT dbo.WorkerRestriction (WorkerId, Reason, CreatedAt)
-            VALUES (@WorkerId, @Finding, @Now);
+            VALUES (@WorkerId, @CorrectionRequirement, @Now);
             SET @RestrictionId = CONVERT(int, SCOPE_IDENTITY());
         END;
 
         INSERT dbo.ServiceInspection (
             OrderId, WorkerId, ReviewDistrict, InspectorId, Score, Finding, RestrictionId,
-            Status, InspectedAt, ClosedAt, ChangedBy
+            Status, InspectedAt, ClosedAt, ChangedBy, InspectionMethod, IssueTag, CorrectionRequirement
         )
         VALUES (@OrderId, @WorkerId, @District, @ActorId, @Score, @Finding, @RestrictionId,
                 CASE WHEN @RestrictionId IS NULL THEN 'CLOSED' ELSE 'OPEN' END, @Now,
-                CASE WHEN @RestrictionId IS NULL THEN @Now END, @ActorId);
+                CASE WHEN @RestrictionId IS NULL THEN @Now END, @ActorId, @InspectionMethod, NULLIF(TRIM(@IssueTag), N''),
+                @CorrectionRequirement);
         COMMIT TRANSACTION;
     END TRY
     BEGIN CATCH

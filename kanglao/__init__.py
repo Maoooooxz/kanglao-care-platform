@@ -43,8 +43,8 @@ def create_app(config=None):
                                  cell_display=cell_display, status_class=status_class,
                                  status_label=status_label)
 
-    from . import account, archive, health, home, services, subsidy
-    for module in (account, home, archive, services, health, subsidy):
+    from . import account, archive, health, home, oversight, services, subsidy
+    for module in (account, home, archive, services, health, subsidy, oversight):
         app.register_blueprint(module.bp)
 
     @app.get("/healthz")

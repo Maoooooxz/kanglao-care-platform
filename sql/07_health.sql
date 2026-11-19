@@ -20,7 +20,7 @@ IF OBJECT_ID(N'dbo.HealthDevice', N'U') IS NULL
     CREATE TABLE dbo.HealthDevice (
         DeviceId int IDENTITY PRIMARY KEY,
         DeviceCode varchar(24) NOT NULL UNIQUE,
-        DeviceType varchar(12) NOT NULL CHECK (DeviceType IN ('VITALS', 'SOS')),
+        DeviceType varchar(12) NOT NULL,
         IsEnabled bit NOT NULL DEFAULT 1
     );
 
@@ -157,6 +157,30 @@ IF OBJECT_ID(N'dbo.HealthEventAudit', N'U') IS NULL
         Details nvarchar(400) NULL
     );
 
+IF OBJECT_ID(N'dbo.CK_HealthDevice_Type', N'C') IS NULL
+BEGIN
+    DECLARE @OldDeviceCheck sysname = (SELECT TOP (1) name FROM sys.check_constraints
+        WHERE parent_object_id=OBJECT_ID(N'dbo.HealthDevice') AND definition LIKE '%VITALS%' AND definition LIKE '%SOS%');
+    IF @OldDeviceCheck IS NOT NULL
+    BEGIN
+        DECLARE @DropDeviceCheck nvarchar(max)=N'ALTER TABLE dbo.HealthDevice DROP CONSTRAINT '+QUOTENAME(@OldDeviceCheck);
+        EXEC sys.sp_executesql @DropDeviceCheck;
+    END;
+    ALTER TABLE dbo.HealthDevice ADD CONSTRAINT CK_HealthDevice_Type
+        CHECK (DeviceType IN ('VITALS','SOS','BP_MONITOR','ECG_PATCH','FALL_RADAR'));
+END;
+IF COL_LENGTH(N'dbo.HealthDevice', N'IsDemo') IS NULL
+    ALTER TABLE dbo.HealthDevice ADD IsDemo bit NOT NULL CONSTRAINT DF_HealthDevice_Demo DEFAULT 0;
+IF COL_LENGTH(N'dbo.HealthBinding', N'InstallationLocation') IS NULL
+    ALTER TABLE dbo.HealthBinding ADD InstallationLocation nvarchar(120) NULL;
+IF COL_LENGTH(N'dbo.HealthEvent', N'ReportKind') IS NULL
+    ALTER TABLE dbo.HealthEvent ADD ReportKind varchar(12) NULL, ReportText nvarchar(400) NULL,
+        CONSTRAINT CK_HealthEvent_Report CHECK (
+            (ReportKind IS NULL AND ReportText IS NULL)
+            OR (SourceType='MANUAL' AND ReportKind IS NOT NULL AND ReportKind IN ('HEALTH','HOME_RISK')
+                AND ReportText IS NOT NULL AND LEN(ReportText)>0)
+        );
+
 COMMIT TRANSACTION;
 GO
 
@@ -196,10 +220,25 @@ AS
     );
 GO
 
+CREATE OR ALTER FUNCTION dbo.fn_HealthNoticeRecipients(@ArchiveNo varchar(20))
+RETURNS TABLE AS RETURN
+(
+    SELECT account.UserId
+    FROM dbo.ElderArchive elder CROSS JOIN dbo.AppUser account
+    WHERE elder.ArchiveNo=@ArchiveNo AND account.Active=1
+      AND ((account.Role='community' AND account.CommunityId=elder.CommunityId)
+        OR (account.Role IN ('resident','family') AND account.ArchiveNo=elder.ArchiveNo)
+        OR (account.Role='caregiver' AND EXISTS (
+            SELECT 1 FROM dbo.v_HealthAssignedWorker assignment
+            WHERE assignment.ArchiveNo=elder.ArchiveNo AND assignment.WorkerId=account.WorkerId
+        )))
+);
+GO
+
 CREATE OR ALTER VIEW dbo.v_HealthDeviceBindings
 AS
     SELECT binding.BindingId, device.DeviceId, device.DeviceCode, device.DeviceType, device.IsEnabled,
-           binding.ArchiveNo, binding.StartsAt, binding.EndsAt
+           binding.ArchiveNo, binding.StartsAt, binding.EndsAt, binding.InstallationLocation
     FROM dbo.HealthBinding AS binding
     JOIN dbo.HealthDevice AS device ON device.DeviceId = binding.DeviceId;
 GO
@@ -234,7 +273,8 @@ AS
                 WHEN evt.ArrivedAt IS NOT NULL THEN 'ARRIVED'
                 WHEN evt.RespondedAt IS NOT NULL THEN 'RESPONDED'
                 WHEN evt.EscalatedAt IS NOT NULL THEN 'ESCALATED'
-                ELSE 'OPEN' END AS State
+                 ELSE 'OPEN' END AS State,
+           evt.ReportKind, evt.ReportText
     FROM dbo.HealthEvent AS evt
     JOIN dbo.ElderArchive AS elder ON elder.ArchiveNo = evt.ArchiveNo
     LEFT JOIN dbo.AppUser AS responder ON responder.UserId = evt.RespondedBy;
@@ -284,7 +324,7 @@ GO
 
 CREATE OR ALTER PROCEDURE dbo.usp_RegisterHealthDevice
     @DeviceCode varchar(24), @DeviceType varchar(12), @ArchiveNo varchar(20), @ActorId int,
-    @At datetime2(0) = NULL
+    @At datetime2(0) = NULL, @InstallationLocation nvarchar(120) = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -299,13 +339,15 @@ BEGIN
 
     BEGIN TRANSACTION;
     INSERT dbo.HealthDevice (DeviceCode, DeviceType) VALUES (@DeviceCode, @DeviceType);
-    INSERT dbo.HealthBinding (DeviceId, ArchiveNo, StartsAt) VALUES (CONVERT(int, SCOPE_IDENTITY()), @ArchiveNo, @At);
+    INSERT dbo.HealthBinding (DeviceId, ArchiveNo, StartsAt, InstallationLocation)
+    VALUES (CONVERT(int, SCOPE_IDENTITY()), @ArchiveNo, @At, NULLIF(TRIM(@InstallationLocation), N''));
     COMMIT TRANSACTION;
 END;
 GO
 
 CREATE OR ALTER PROCEDURE dbo.usp_BindHealthDevice
-    @DeviceCode varchar(24), @ArchiveNo varchar(20), @ActorId int = NULL, @At datetime2(0) = NULL
+    @DeviceCode varchar(24), @ArchiveNo varchar(20), @ActorId int = NULL, @At datetime2(0) = NULL,
+    @InstallationLocation nvarchar(120) = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -328,7 +370,8 @@ BEGIN
         WHERE old.BindingId = (SELECT TOP (1) BindingId FROM dbo.HealthBinding WHERE DeviceId = @DeviceId ORDER BY StartsAt DESC)
     )
         THROW 51701, N'只能重新绑定本社区此前登记的设备。', 1;
-    INSERT dbo.HealthBinding (DeviceId, ArchiveNo, StartsAt) VALUES (@DeviceId, @ArchiveNo, @At);
+    INSERT dbo.HealthBinding (DeviceId, ArchiveNo, StartsAt, InstallationLocation)
+    VALUES (@DeviceId, @ArchiveNo, @At, NULLIF(TRIM(@InstallationLocation), N''));
     COMMIT TRANSACTION;
 END;
 GO
@@ -377,7 +420,7 @@ BEGIN
             @ReadingId int, @AlertId int;
     BEGIN TRANSACTION;
     SELECT @DeviceId = DeviceId FROM dbo.HealthDevice WITH (UPDLOCK, HOLDLOCK)
-    WHERE DeviceCode = @DeviceCode AND IsEnabled = 1 AND DeviceType = 'VITALS';
+    WHERE DeviceCode = @DeviceCode AND IsEnabled = 1 AND DeviceType IN ('VITALS','BP_MONITOR','ECG_PATCH','FALL_RADAR');
     IF @DeviceId IS NULL THROW 51702, N'设备不存在、已停用或不支持体征上报。', 1;
 
     SELECT @ExistingId = reading.ReadingId, @ArchiveNo = binding.ArchiveNo
@@ -419,12 +462,55 @@ BEGIN
         VALUES (@ReadingId, @Severity, @Now, DATEADD(minute, @TriageMinutes, @Now));
         SET @AlertId = CONVERT(int, SCOPE_IDENTITY());
         INSERT dbo.HealthNotice (RecipientUserId, AlertId, Kind, CreatedAt)
-        SELECT account.UserId, @AlertId, 'TRIAGE', @Now
-        FROM dbo.AppUser AS account
-        JOIN dbo.ElderArchive AS elder ON elder.CommunityId = account.CommunityId
-        WHERE elder.ArchiveNo = @ArchiveNo AND account.Role = 'community' AND account.Active = 1;
+        SELECT recipient.UserId, @AlertId, 'TRIAGE', @Now
+        FROM dbo.fn_HealthNoticeRecipients(@ArchiveNo) AS recipient;
     END;
     COMMIT TRANSACTION;
+END;
+GO
+
+CREATE OR ALTER PROCEDURE dbo.usp_SimulateHealthReadings @Now datetime2(0) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    SET @Now=COALESCE(@Now,SYSUTCDATETIME());
+    DECLARE @Minute int=DATEDIFF(minute,'20000101',@Now);
+    DECLARE @CapturedAt datetime2(0)=DATEADD(minute,@Minute,CONVERT(datetime2(0),'20000101'));
+    DECLARE @DeviceId int, @Code varchar(24), @Metric varchar(24), @Packet varchar(64), @Value decimal(10,2);
+    DECLARE devices CURSOR LOCAL FAST_FORWARD FOR
+        SELECT DeviceId FROM dbo.HealthDevice WHERE IsDemo=1 AND IsEnabled=1
+          AND DeviceType IN ('VITALS','BP_MONITOR','ECG_PATCH','FALL_RADAR') ORDER BY DeviceId;
+    OPEN devices;
+    FETCH NEXT FROM devices INTO @DeviceId;
+    WHILE @@FETCH_STATUS=0
+    BEGIN
+        BEGIN TRANSACTION;
+        SELECT @Code=NULL, @Metric=NULL, @Value=NULL;
+        SELECT @Code=DeviceCode, @Metric=CASE DeviceType
+            WHEN 'BP_MONITOR' THEN 'DEMO-SYSTOLIC' WHEN 'ECG_PATCH' THEN 'DEMO-ECG-RATE'
+            WHEN 'FALL_RADAR' THEN 'DEMO-FALL' ELSE 'DEMO-METRIC-1' END
+        FROM dbo.HealthDevice WITH (UPDLOCK,HOLDLOCK)
+        WHERE DeviceId=@DeviceId AND IsDemo=1 AND IsEnabled=1 AND DeviceType<>'SOS';
+        SET @Packet=CONCAT('SIM-',@DeviceId,'-',@Minute);
+        IF @Code IS NOT NULL AND NOT EXISTS (SELECT 1 FROM dbo.HealthReading WHERE PacketKey=@Packet)
+           AND EXISTS (
+               SELECT 1 FROM dbo.HealthBinding binding JOIN dbo.ElderArchive elder ON elder.ArchiveNo=binding.ArchiveNo
+               WHERE binding.DeviceId=@DeviceId AND binding.StartsAt<=@CapturedAt AND binding.EndsAt IS NULL
+                 AND elder.IsActive=1 AND LEFT(elder.IdNumber,6)='000000'
+           )
+        BEGIN
+            SELECT @Value=CASE WHEN (@Minute+@DeviceId)%5=0 THEN MaximumValue+1
+                               ELSE (MinimumValue+MaximumValue)/2.0 END
+            FROM dbo.HealthThreshold WHERE MetricCode=@Metric;
+            IF @Value IS NOT NULL
+                EXEC dbo.usp_RecordHealthReading @Code,@Packet,@Metric,@Value,@CapturedAt,@Now=@Now;
+        END;
+        COMMIT;
+        FETCH NEXT FROM devices INTO @DeviceId;
+    END;
+    CLOSE devices;
+    DEALLOCATE devices;
 END;
 GO
 
@@ -478,7 +564,7 @@ GO
 
 CREATE OR ALTER PROCEDURE dbo.usp_OpenHealthEvent
     @ArchiveNo varchar(20), @RequestKey varchar(64), @SourceType varchar(12), @ActorId int = NULL,
-    @Now datetime2(0) = NULL
+    @Now datetime2(0) = NULL, @ReportKind varchar(12) = NULL, @ReportText nvarchar(400) = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -486,28 +572,35 @@ BEGIN
     SET @Now = COALESCE(@Now, CONVERT(datetime2(0), SYSUTCDATETIME()));
     IF @SourceType NOT IN ('SOS', 'MANUAL') OR @SourceType IS NULL OR NULLIF(TRIM(@RequestKey), '') IS NULL
         THROW 51707, N'请提供事件来源和唯一请求编号。', 1;
+    SET @ReportText=NULLIF(TRIM(@ReportText),N'');
+    IF (@ReportKind IS NOT NULL OR @ReportText IS NOT NULL)
+       AND (@SourceType<>'MANUAL' OR @ReportKind IS NULL OR @ReportKind NOT IN ('HEALTH','HOME_RISK') OR @ReportText IS NULL)
+        THROW 51707, N'人工报告须填写正确的异常来源与说明。', 1;
     IF @ActorId IS NOT NULL AND (NOT EXISTS (
         SELECT 1 FROM dbo.AppUser WHERE UserId = @ActorId
           AND (Role IN ('community', 'caregiver') OR (Role IN ('resident', 'family') AND @SourceType = 'SOS'))
     ) OR NOT EXISTS (SELECT 1 FROM dbo.fn_HealthArchiveScope(@ActorId) WHERE ArchiveNo = @ArchiveNo))
         THROW 51701, N'当前账号不能为该老人发起此事件。', 1;
 
-    DECLARE @ExistingArchive varchar(20), @ExistingSource varchar(12),
+    DECLARE @ExistingArchive varchar(20), @ExistingSource varchar(12), @ExistingKind varchar(12), @ExistingText nvarchar(400),
             @Severity tinyint = CASE WHEN @SourceType = 'SOS' THEN 3 ELSE 2 END;
     BEGIN TRANSACTION;
-    SELECT @ExistingArchive = ArchiveNo, @ExistingSource = SourceType
+    SELECT @ExistingArchive = ArchiveNo, @ExistingSource = SourceType, @ExistingKind=ReportKind, @ExistingText=ReportText
     FROM dbo.HealthEvent WITH (UPDLOCK, HOLDLOCK) WHERE RequestKey = @RequestKey;
     IF @ExistingArchive IS NOT NULL
     BEGIN
         IF @ExistingArchive <> @ArchiveNo OR @ExistingSource <> @SourceType
+           OR ISNULL(@ExistingKind,'')<>ISNULL(@ReportKind,'') OR ISNULL(@ExistingText,N'')<>ISNULL(@ReportText,N'')
             THROW 51707, N'该请求编号已用于其他事件。', 1;
         COMMIT TRANSACTION;
         RETURN;
     END;
 
-    INSERT dbo.HealthEvent (ArchiveNo, RequestKey, SourceType, Origin, Severity, OpenedAt, ResponseDeadline, LastActorId)
+    INSERT dbo.HealthEvent (ArchiveNo, RequestKey, SourceType, Origin, Severity, OpenedAt, ResponseDeadline, LastActorId,
+                            ReportKind, ReportText)
     VALUES (@ArchiveNo, @RequestKey, @SourceType, CASE WHEN @ActorId IS NULL THEN 'DEVICE' ELSE 'USER' END,
-            @Severity, @Now, DATEADD(minute, dbo.fn_HealthResponseMinutes(@ArchiveNo, @Severity), @Now), @ActorId);
+            @Severity, @Now, DATEADD(minute, dbo.fn_HealthResponseMinutes(@ArchiveNo, @Severity), @Now), @ActorId,
+            @ReportKind, @ReportText);
     COMMIT TRANSACTION;
 END;
 GO

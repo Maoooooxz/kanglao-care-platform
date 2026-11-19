@@ -19,11 +19,12 @@ SELECT n, CONCAT(N'演示社区 ', n), N'海淀演示区', 40.008, 116.341, 3000
 FROM @Samples s WHERE NOT EXISTS (SELECT 1 FROM dbo.Community c WHERE c.CommunityId=s.n);
 
 INSERT dbo.ElderArchive
-    (IdNumber, ArchiveNo, FullName, BirthDate, Address, CommunityId, GuardianName, Tags)
+    (IdNumber, ArchiveNo, FullName, BirthDate, Address, CommunityId, GuardianName, Tags, SubsidyCategory)
 SELECT CONCAT('00000019500101', RIGHT(CONCAT('0000', n),4)),
        CONCAT('E', RIGHT(CONCAT('0000', n),4)), CONCAT(N'演示老人 ', n),
        DATEFROMPARTS(1950,1,1), CONCAT(N'演示路 ', n, N' 号'), n, CONCAT(N'演示监护人 ', n),
-       CASE WHEN n%2=0 THEN N'独居' ELSE N'日常照护' END
+       CASE WHEN n%2=0 THEN N'独居' ELSE N'日常照护' END,
+       IIF(n%4=0,'LOW_INCOME','GENERAL')
 FROM @Samples s
 WHERE NOT EXISTS (
     SELECT 1 FROM dbo.ElderArchive e WHERE e.ArchiveNo=CONCAT('E',RIGHT(CONCAT('0000',s.n),4))
@@ -31,7 +32,8 @@ WHERE NOT EXISTS (
 
 INSERT dbo.AbilityAssessment
     (AssessmentNo, ArchiveNo, ScaleCode, Score, AbilityLevel, EvaluatorName, AssessmentDate, ValidThrough)
-SELECT CONCAT('V1-DEMO-ASMT-', n), e.ArchiveNo, 'ADL', 75, N'轻度失能', N'演示评估员',
+SELECT CONCAT('V1-DEMO-ASMT-', n), e.ArchiveNo, 'ADL', IIF(n%4=0,40,75),
+       IIF(n%4=0,N'重度失能',N'轻度失能'), N'演示评估员',
        @Today, DATEADD(day, CASE WHEN n % 5=0 THEN 7 ELSE 60 END, @Today)
 FROM @Samples s JOIN dbo.ElderArchive e
     ON e.ArchiveNo=CONCAT('E',RIGHT(CONCAT('0000',s.n),4))

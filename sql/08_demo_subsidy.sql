@@ -13,8 +13,7 @@ SET XACT_ABORT ON;
 SET NOCOUNT ON;
 
 SELECT visit.OrderId, visit.ArchiveNo, visit.ServiceTypeId, visit.CommunityId, visit.WorkerId,
-       visit.CheckOutAt, community.District,
-       CONVERT(date, DATEADD(hour, 8, visit.CheckOutAt)) AS ServiceDate
+       visit.CheckOutAt, community.District, visit.SubsidyCategory, visit.SubsidyAbilityLevel
 INTO #DemoSubsidyVisits
 FROM dbo.v_SubsidyEligibleOrder visit
 JOIN dbo.ServiceOrder orders ON orders.OrderId = visit.OrderId
@@ -30,16 +29,21 @@ IF NOT EXISTS (SELECT 1 FROM #DemoSubsidyVisits)
 BEGIN TRANSACTION;
 
 WITH pairs AS (
-    SELECT DISTINCT visit.District, visit.ServiceTypeId, service.Name
+    SELECT DISTINCT visit.District, visit.ServiceTypeId, service.Name, basis.Category, basis.AbilityLevel, basis.Rate
     FROM #DemoSubsidyVisits visit JOIN dbo.ServiceType service ON service.ServiceTypeId = visit.ServiceTypeId
+    CROSS APPLY (VALUES ('ANY',N'通用',30.00), ('LOW_INCOME',N'重度失能',45.00)) basis(Category, AbilityLevel, Rate)
+    WHERE basis.Category = 'ANY'
+       OR (basis.Category = visit.SubsidyCategory AND basis.AbilityLevel = visit.SubsidyAbilityLevel)
 )
-INSERT dbo.SubsidyPolicy (PolicyName, District, ServiceTypeId, ValidFrom, ValidThrough, HourlyRate, MaxPerOrder)
-SELECT LEFT(CONCAT(N'演示补贴政策 ', pairs.Name), 100), pairs.District, pairs.ServiceTypeId,
-       '20200101', '20991231', 30.00, 80.00
+INSERT dbo.SubsidyPolicy (PolicyName, District, ServiceTypeId, ValidFrom, ValidThrough, HourlyRate, MaxPerOrder,
+                          BeneficiaryCategory, AbilityLevel)
+SELECT LEFT(CONCAT(IIF(pairs.Category = 'ANY', N'演示通用补贴 ', N'演示低保重度补贴 '), pairs.Name), 100),
+       pairs.District, pairs.ServiceTypeId, '20200101', '20991231', pairs.Rate, 80.00, pairs.Category, pairs.AbilityLevel
 FROM pairs
 WHERE NOT EXISTS (
     SELECT 1 FROM dbo.SubsidyPolicy existing WITH (UPDLOCK, HOLDLOCK)
     WHERE existing.District = pairs.District AND existing.ServiceTypeId = pairs.ServiceTypeId
+      AND existing.BeneficiaryCategory = pairs.Category AND existing.AbilityLevel = pairs.AbilityLevel
       AND existing.ValidFrom <= '20991231' AND existing.ValidThrough >= '20200101'
 );
 
@@ -49,21 +53,16 @@ DECLARE @ArchiveNo varchar(20), @CommunityId int, @ServiceTypeId int, @PeriodMon
 DECLARE @ClaimId int, @Creator int, @Street int, @Civil int, @District nvarchar(80), @DemoNumber int = 0;
 
 DECLARE demo_claims CURSOR LOCAL FAST_FORWARD FOR
-    SELECT visit.ArchiveNo, visit.CommunityId, visit.ServiceTypeId, dates.PeriodMonth,
+    SELECT visit.ArchiveNo, visit.CommunityId, visit.ServiceTypeId, visit.PeriodMonth,
            CONCAT(N'[', STRING_AGG(CONVERT(nvarchar(max), visit.OrderId), N',') WITHIN GROUP (ORDER BY visit.OrderId), N']')
-    FROM #DemoSubsidyVisits visit
-    CROSS APPLY (VALUES (DATEFROMPARTS(YEAR(visit.ServiceDate), MONTH(visit.ServiceDate), 1))) dates(PeriodMonth)
-    WHERE EXISTS (
-        SELECT 1 FROM dbo.SubsidyPolicy policy
-        WHERE policy.District = visit.District AND policy.ServiceTypeId = visit.ServiceTypeId
-          AND visit.ServiceDate BETWEEN policy.ValidFrom AND policy.ValidThrough
-    ) AND NOT EXISTS (
+    FROM dbo.v_SubsidyApplicableOrder visit JOIN #DemoSubsidyVisits demo ON demo.OrderId = visit.OrderId
+    WHERE NOT EXISTS (
         SELECT 1 FROM dbo.SubsidyClaim existing
         WHERE existing.ArchiveNo = visit.ArchiveNo AND existing.ServiceTypeId = visit.ServiceTypeId
-          AND existing.PeriodMonth = dates.PeriodMonth
+           AND existing.PeriodMonth = visit.PeriodMonth
     )
-    GROUP BY visit.ArchiveNo, visit.CommunityId, visit.ServiceTypeId, dates.PeriodMonth
-    ORDER BY visit.ArchiveNo, dates.PeriodMonth, visit.ServiceTypeId, visit.CommunityId;
+    GROUP BY visit.ArchiveNo, visit.CommunityId, visit.ServiceTypeId, visit.PeriodMonth
+    ORDER BY visit.ArchiveNo, visit.PeriodMonth, visit.ServiceTypeId, visit.CommunityId;
 
 OPEN demo_claims;
 FETCH NEXT FROM demo_claims INTO @ArchiveNo, @CommunityId, @ServiceTypeId, @PeriodMonth, @OrderIdsJson;
@@ -124,7 +123,7 @@ WHERE NOT EXISTS (
 
 INSERT dbo.ServiceInspection (
     OrderId, WorkerId, ReviewDistrict, InspectorId, Score, Finding, RestrictionId,
-    Status, InspectedAt, Correction, CorrectedAt, ClosedAt, ChangedBy
+    Status, InspectedAt, Correction, CorrectedAt, ClosedAt, ChangedBy, InspectionMethod, IssueTag, CorrectionRequirement
 )
 SELECT sample.OrderId, sample.WorkerId, sample.District, inspector.UserId, 45 + (sample.Position % 12),
        sample.Finding, restriction.RestrictionId,
@@ -133,7 +132,7 @@ SELECT sample.OrderId, sample.WorkerId, sample.District, inspector.UserId, 45 + 
        CASE WHEN sample.Position <= 18 THEN N'已按抽查要求复核服务记录' END,
        CASE WHEN sample.Position <= 18 THEN DATEADD(hour, 2, sample.CheckOutAt) END,
        CASE WHEN sample.Position < 18 THEN DATEADD(hour, 3, sample.CheckOutAt) END,
-       inspector.UserId
+       inspector.UserId, IIF(sample.Position % 2 = 0,'PHONE','VISIT'), N'服务记录', N'核对服务记录并提交整改说明'
 FROM #DemoInspections sample
 JOIN dbo.WorkerRestriction restriction ON restriction.WorkerId = sample.WorkerId AND restriction.Reason = sample.Finding
 OUTER APPLY (

@@ -1,6 +1,9 @@
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+import json
 from uuid import uuid4
 
+import pytest
 from werkzeug.security import generate_password_hash
 
 from conftest import log_in, submit
@@ -13,9 +16,14 @@ def _post(client, path, **fields):
     assert response.status_code == 302, response.get_data(as_text=True)
 
 
-def _cleanup(application, archive_no, worker_id, family_name, worker_name):
+def _cleanup(application, archive_no, worker_id, signer_name, worker_name):
     with application.app_context(), transaction():
         execute("""
+            DELETE log FROM dbo.SubsidyClaimLog log JOIN dbo.SubsidyClaim claim ON claim.ClaimId=log.ClaimId
+            WHERE claim.ArchiveNo=?;
+            DELETE line FROM dbo.SubsidyClaimOrder line JOIN dbo.SubsidyClaim claim ON claim.ClaimId=line.ClaimId
+            WHERE claim.ArchiveNo=?;
+            DELETE dbo.SubsidyClaim WHERE ArchiveNo=?;
             DELETE a FROM dbo.ServiceVisitAudit a JOIN dbo.ServiceOrder o ON o.OrderId=a.OrderId WHERE o.ArchiveNo=?;
             DELETE v FROM dbo.ServiceVisit v JOIN dbo.ServiceOrder o ON o.OrderId=v.OrderId WHERE o.ArchiveNo=?;
             DELETE a FROM dbo.ServiceDispatchAudit a JOIN dbo.ServiceDispatch d ON d.DispatchId=a.DispatchId
@@ -32,14 +40,15 @@ def _cleanup(application, archive_no, worker_id, family_name, worker_name):
             DELETE dbo.WorkerCommunity WHERE WorkerId=?;
             DELETE dbo.Worker WHERE WorkerId=?;
             DELETE dbo.ElderArchive WHERE ArchiveNo=?;
-        """, *([archive_no] * 9), family_name, worker_name, *([worker_id] * 4), archive_no)
+        """, *([archive_no] * 12), signer_name, worker_name, *([worker_id] * 4), archive_no)
 
 
-def test_http_service_lifecycle_produces_subsidy_eligible_order(application, password):
+@pytest.mark.parametrize("signer_role", ("family", "resident"))
+def test_http_service_lifecycle_through_subsidy_payment(application, password, signer_role):
     suffix = uuid4().hex[:10]
     archive_no = f"HTTP-{suffix.upper()}"
     id_number = f"000000{uuid4().int % 10**12:012d}"
-    family_name, worker_name = f"http-family-{suffix}", f"http-worker-{suffix}"
+    signer_name, worker_name = f"http-{signer_role}-{suffix}", f"http-worker-{suffix}"
     worker_id = None
     today = beijing_today()
     valid_through = today + timedelta(days=7)
@@ -47,7 +56,7 @@ def test_http_service_lifecycle_produces_subsidy_eligible_order(application, pas
     appointment = now + timedelta(minutes=20)
     booking_end = appointment + timedelta(minutes=30)
     community = application.test_client()
-    family = application.test_client()
+    signer = application.test_client()
     caregiver = application.test_client()
     log_in(community, "community", password)
 
@@ -64,7 +73,7 @@ def test_http_service_lifecycle_produces_subsidy_eligible_order(application, pas
 
         _post(community, "/archives/", op="create", archive_no=archive_no, id_number=id_number,
               name="流程验证老人", birth_date="1950-01-01", address="流程验证地址",
-              latitude=str(area["Latitude"]), longitude=str(area["Longitude"]))
+              latitude=str(area["Latitude"]), longitude=str(area["Longitude"]), subsidy_category="LOW_INCOME")
         with application.app_context():
             assert one("SELECT ArchiveNo FROM dbo.ElderArchive WHERE ArchiveNo=?", archive_no) is not None
         _post(community, f"/archives/{archive_no}", op="assessment", scale="ADL", score="75",
@@ -83,10 +92,10 @@ def test_http_service_lifecycle_produces_subsidy_eligible_order(application, pas
                     now.replace(tzinfo=None) - timedelta(hours=1), now.replace(tzinfo=None) + timedelta(hours=3))
             password_hash = generate_password_hash(password)
             execute("""INSERT dbo.AppUser(Username,DisplayName,PasswordHash,Role,ArchiveNo)
-                       VALUES(?,?,?,'family',?)""", family_name, "流程验证家属", password_hash, archive_no)
+                       VALUES(?,?,?,?,?)""", signer_name, "流程验证签字人", password_hash, signer_role, archive_no)
             execute("""INSERT dbo.AppUser(Username,DisplayName,PasswordHash,Role,WorkerId)
                        VALUES(?,?,?,'caregiver',?)""", worker_name, "流程验证护工", password_hash, worker_id)
-            family_id = one("SELECT UserId FROM dbo.AppUser WHERE Username=?", family_name)["UserId"]
+            signer_id = one("SELECT UserId FROM dbo.AppUser WHERE Username=?", signer_name)["UserId"]
 
         _post(community, "/services/plans", operation="CREATE", archive_no=archive_no,
               package_id=area["PackageId"], worker_id=worker_id, starts_on=(today - timedelta(days=1)).isoformat(),
@@ -94,8 +103,8 @@ def test_http_service_lifecycle_produces_subsidy_eligible_order(application, pas
         with application.app_context():
             assert one("SELECT PlanId FROM dbo.CarePlan WHERE ArchiveNo=? AND Status='ACTIVE'", archive_no)
 
-        log_in(family, family_name, password)
-        _post(family, "/services/orders", operation="BOOK", archive_no=archive_no,
+        log_in(signer, signer_name, password)
+        _post(signer, "/services/orders", operation="BOOK", archive_no=archive_no,
               service_type_id=area["ServiceTypeId"], start=appointment.astimezone(SHANGHAI).isoformat(timespec="seconds"),
               end=booking_end.astimezone(SHANGHAI).isoformat(timespec="seconds"))
         with application.app_context():
@@ -124,12 +133,66 @@ def test_http_service_lifecycle_produces_subsidy_eligible_order(application, pas
             assert one("SELECT Status FROM dbo.ServiceOrder WHERE OrderId=?", order_id)["Status"] == "AWAITING_CONFIRMATION"
             assert one("SELECT OrderId FROM dbo.v_SubsidyEligibleOrder WHERE OrderId=?", order_id) is None
 
-        _post(family, "/services/orders", operation="CONFIRM", order_id=order_id, reason="模拟家属签名")
+        outsider = application.test_client()
+        log_in(outsider, "resident", password)
+        order_path = f"/services/orders/{order_id}"
+        assert outsider.get(order_path).status_code == 404
+        assert submit(outsider, order_path, operation="CONFIRM", reason="无权签字").status_code == 404
+        assert submit(outsider, "/services/orders", operation="CONFIRM", order_id=order_id,
+                      reason="无权签字").status_code == 404
+        signature_label = "家属电子签字" if signer_role == "family" else "老人本人电子签字"
+        assert signature_label in signer.get("/services/orders?status=AWAITING_CONFIRMATION").get_data(as_text=True)
+        details = signer.get(order_path).get_data(as_text=True)
+        assert "模拟上门服务完成" in details and signature_label in details and "待核定" in details
+        _post(signer, order_path, operation="CONFIRM", reason="模拟签名")
+        _post(signer, "/services/orders", operation="CONFIRM", order_id=order_id, reason="重复签名不应覆盖")
         with application.app_context():
-            eligible = one("SELECT OrderId,WorkerId,EffectiveMinutes FROM dbo.v_SubsidyEligibleOrder WHERE OrderId=?", order_id)
+            eligible = one("""SELECT OrderId,WorkerId,EffectiveMinutes,SubsidyCategory,SubsidyAbilityLevel
+                            FROM dbo.v_SubsidyEligibleOrder WHERE OrderId=?""", order_id)
             assert eligible is not None and eligible["WorkerId"] == worker_id and eligible["EffectiveMinutes"] >= 1
-            signed = one("SELECT ConfirmedBy,DATALENGTH(ConfirmationHash) AS HashBytes FROM dbo.ServiceVisit WHERE OrderId=?",
+            assert eligible["SubsidyCategory"] == "LOW_INCOME" and eligible["SubsidyAbilityLevel"] == area["AbilityLevel"]
+            signed = one("""SELECT ConfirmedBy,ConfirmationText,DATALENGTH(ConfirmationHash) AS HashBytes
+                          FROM dbo.ServiceVisit WHERE OrderId=?""",
                          order_id)
-            assert signed == {"ConfirmedBy": family_id, "HashBytes": 32}
+            assert signed == {"ConfirmedBy": signer_id, "ConfirmationText": "模拟签名", "HashBytes": 32}
+
+        _post(community, "/subsidy/", operation="submit", order_ids=order_id)
+        with application.app_context():
+            claim = one("""SELECT claim.ClaimId, claim.Status, line.SubsidyCategory, line.SubsidyAbilityLevel
+                         FROM dbo.SubsidyClaim claim JOIN dbo.SubsidyClaimOrder line ON line.ClaimId=claim.ClaimId
+                         WHERE line.OrderId=?""", order_id)
+            assert claim is not None and claim["Status"] == "STREET"
+            assert claim["SubsidyCategory"] == "LOW_INCOME" and claim["SubsidyAbilityLevel"] == area["AbilityLevel"]
+
+        path = f'/subsidy/{claim["ClaimId"]}'
+        street, civil = application.test_client(), application.test_client()
+        log_in(street, "street", password)
+        log_in(civil, "civil", password)
+        claim_page = street.get(path)
+        assert claim_page.status_code == 200 and "申报证明归档" in claim_page.get_data(as_text=True)
+        assert "待核定" in signer.get(order_path).get_data(as_text=True)
+        _post(street, path, operation="review", action="return", note="请补充说明")
+        with application.app_context():
+            execute("UPDATE dbo.ServiceVisit SET ServiceRecord=N'重新提交的服务说明' WHERE OrderId=?", order_id)
+        _post(community, path, operation="submit", order_ids=order_id)
+        with application.app_context():
+            snapshots = one("""SELECT TOP (1) old.EvidenceSnapshot AS Original, updated.EvidenceSnapshot AS Revised
+                             FROM dbo.SubsidyClaimLog old JOIN dbo.SubsidyClaimLog updated ON updated.ClaimId=old.ClaimId
+                             WHERE old.ClaimId=? AND old.CurrentStatus='STREET' AND updated.CurrentStatus='STREET'
+                               AND updated.LogId>old.LogId ORDER BY old.LogId,updated.LogId""", claim["ClaimId"])
+            original, revised = (json.loads(snapshots[key])[0] for key in ("Original", "Revised"))
+            assert original["ServiceRecord"] == "模拟上门服务完成" and len(original["ConfirmationHash"]) == 64
+            assert revised["ServiceRecord"] == "重新提交的服务说明"
+        _post(street, path, operation="review", action="approve", note="街道审核通过")
+        _post(civil, path, operation="review", action="approve", note="民政审核通过")
+        _post(civil, path, operation="review", action="pay", note="模拟拨付")
+        with application.app_context():
+            paid = one("""SELECT claim.Status,claim.PaidAt,line.OrderPrice-line.Amount AS OutOfPocket
+                         FROM dbo.SubsidyClaim claim JOIN dbo.SubsidyClaimOrder line ON line.ClaimId=claim.ClaimId
+                         WHERE claim.ClaimId=?""", claim["ClaimId"])
+            assert paid["Status"] == "PAID" and paid["PaidAt"] is not None
+        details = signer.get(order_path).get_data(as_text=True)
+        assert "自付" in details and "待核定" not in details
+        assert f'{Decimal(paid["OutOfPocket"]):.2f}' in details
     finally:
-        _cleanup(application, archive_no, worker_id, family_name, worker_name)
+        _cleanup(application, archive_no, worker_id, signer_name, worker_name)

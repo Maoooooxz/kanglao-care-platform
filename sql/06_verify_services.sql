@@ -74,9 +74,17 @@ BEGIN TRY
         THROW 51274, N'进行中服务的状态或评估到期记录有误。', 1;
 
     EXEC dbo.usp_ServiceOrderAction @Order1, 'CHECK_OUT', @WorkerId, N'测试签退并保存服务记录', @Now = @AfterExpiry;
+    IF NOT EXISTS (
+        SELECT 1 FROM dbo.ServiceVisit WHERE OrderId = @Order1 AND WorkStatus = 'REVIEW'
+            AND EffectiveMinutes IS NULL AND OutFence = 1 AND OutShift = 1 AND ReviewReason LIKE N'%晚于预约%'
+    )
+        THROW 51275, N'即使仍在班次和围栏内，超时签退也须人工复核。', 1;
     IF EXISTS (SELECT 1 FROM dbo.v_SubsidyEligibleOrder WHERE OrderId = @Order1)
         THROW 51275, N'尚未家属签字的记录不能申报补贴。', 1;
     EXEC dbo.usp_ServiceOrderAction @Order1, 'CONFIRM', @Reason = N'模拟家属签字', @ActorId = @FamilyActor, @Now = @AfterExpiry;
+    IF EXISTS (SELECT 1 FROM dbo.v_SubsidyEligibleOrder WHERE OrderId = @Order1)
+        THROW 51276, N'签字不能使待复核工时获得补贴资格。', 1;
+    EXEC dbo.usp_ServiceOrderAction @Order1, 'WORK_APPROVE', @Reason = N'人工确认超时服务属实', @Now = @AfterExpiry;
     IF NOT EXISTS (SELECT 1 FROM dbo.v_SubsidyEligibleOrder WHERE OrderId = @Order1 AND WorkerId = @WorkerId AND EffectiveMinutes > 0)
         THROW 51276, N'服务签退及家属签字后无法追溯有效工时。', 1;
     EXEC dbo.usp_ServiceOrderAction @Order1, 'COMPLAIN', @Reason = N'验证投诉', @ActorId = @FamilyActor, @Now = @AfterExpiry;
@@ -109,5 +117,5 @@ BEGIN CATCH
     IF XACT_STATE() <> 0 ROLLBACK;
     IF ERROR_NUMBER() <> 51207 THROW;
 END CATCH;
-PRINT N'PASS 照护、接单班次容量、重叠校验、评估过期、签退与家属签字，并回滚。';
+PRINT N'PASS 照护、班次、评估过期、超时工时复核与家属签字，并回滚。';
 GO

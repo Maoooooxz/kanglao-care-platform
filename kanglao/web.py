@@ -20,7 +20,7 @@ STATUSES = {
     "accepted": ("已接单", "good"), "paid": ("已拨付", "good"), "resolved": ("已整改", "good"),
     "pending_dispatch": ("待派单", "warn"), "offered": ("待接单", "warn"),
     "confirmed": ("已确认", "good"), "ready": ("待派单", "warn"), "manual": ("人工调度", "warn"),
-    "in_service": ("服务中", "good"), "awaiting_confirmation": ("待家属确认", "warn"),
+    "in_service": ("服务中", "good"), "awaiting_confirmation": ("待签字确认", "warn"),
     "on_review": ("待复核", "warn"), "escalated": ("已升级", "bad"),
     "street_pending": ("街道待审", "warn"), "civil_pending": ("民政待审", "warn"),
 }

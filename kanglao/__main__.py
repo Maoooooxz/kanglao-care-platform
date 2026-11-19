@@ -17,12 +17,12 @@ from .db import execute, one, query, transaction
 
 MIGRATIONS = (
     "01_init.sql", "03_add_ability_assessment.sql", "05_platform.sql",
-    "06_services.sql", "07_health.sql", "08_subsidy.sql",
+    "06_services.sql", "07_health.sql", "08_subsidy.sql", "10_course_completion.sql",
 )
 DEMO_BEFORE_USERS = ("05_demo_platform.sql", "06_demo_services.sql")
-DEMO_AFTER_USERS = ("07_demo_health.sql", "08_demo_subsidy.sql")
+DEMO_AFTER_USERS = ("07_demo_health.sql", "08_demo_subsidy.sql", "10_demo_course_completion.sql")
 CHECKS = ("02_verify.sql", "04_verify_assessment.sql", "06_verify_services.sql",
-          "07_verify_health.sql", "08_verify_subsidy.sql")
+          "07_verify_health.sql", "08_verify_subsidy.sql", "10_verify_course_completion.sql")
 
 
 def configure():
@@ -123,11 +123,13 @@ def seed_users():
     print("演示账号已准备。使用 .env 中的演示密码登录。")
 
 
-def process_jobs(app, watch):
+def process_jobs(app, watch, simulate_devices=False):
     jobs = (
         ("评估到期及派单时限", "EXEC dbo.usp_ProcessServiceTimeouts"),
         ("健康告警及应急时限", "EXEC dbo.usp_ProcessHealthTimeouts"),
     )
+    if simulate_devices:
+        jobs = (("演示设备上报", "EXEC dbo.usp_SimulateHealthReadings"), *jobs)
     while True:
         first_error = None
         for title, statement in jobs:
@@ -157,6 +159,7 @@ def main():
     web.add_argument("--port", default=8080, type=int)
     jobs = commands.add_parser("jobs", help="扫描到期和超时")
     jobs.add_argument("--watch", action="store_true", help="每分钟执行一次")
+    jobs.add_argument("--simulate-devices", action="store_true", help="只为合成演示设备生成体征数据")
     args = parser.parse_args()
     load_dotenv(ROOT / ".env")
     if args.command == "configure":
@@ -177,7 +180,7 @@ def main():
         for filename in DEMO_AFTER_USERS:
             apply_sql(filename, args.database)
     elif args.command == "jobs":
-        process_jobs(app, args.watch)
+        process_jobs(app, args.watch, args.simulate_devices)
     else:
         print(f"康老工作台 http://127.0.0.1:{args.port}", flush=True)
         serve(app, host="127.0.0.1", port=args.port)

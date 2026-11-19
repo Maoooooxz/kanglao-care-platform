@@ -51,6 +51,12 @@ BEGIN
     FROM @Demo AS demo
     WHERE NOT EXISTS (SELECT 1 FROM dbo.HealthThreshold AS t WHERE t.MetricCode = demo.MetricCode);
 
+    INSERT dbo.HealthThreshold (MetricCode, MetricName, UnitLabel, MinimumValue, MaximumValue, TriageMinutes, Severity)
+    SELECT metric.Code, metric.Label, N'模拟单位', 0, metric.NormalMax, 5, metric.Severity
+    FROM (VALUES ('DEMO-SYSTOLIC',N'血压演示',100,1), ('DEMO-ECG-RATE',N'心电演示',100,2),
+                 ('DEMO-FALL',N'跌倒事件演示',0,3)) metric(Code,Label,NormalMax,Severity)
+    WHERE NOT EXISTS (SELECT 1 FROM dbo.HealthThreshold threshold WHERE threshold.MetricCode=metric.Code);
+
     INSERT dbo.HealthResponseRule (CommunityId, Severity, ResponseMinutes)
     SELECT c.CommunityId, levels.Severity, levels.ResponseMinutes
     FROM (SELECT DISTINCT CommunityId FROM @Elders) AS c
@@ -58,14 +64,35 @@ BEGIN
     WHERE NOT EXISTS (SELECT 1 FROM dbo.HealthResponseRule AS r
                       WHERE r.CommunityId = c.CommunityId AND r.Severity = levels.Severity);
 
-    INSERT dbo.HealthDevice (DeviceCode, DeviceType)
-    SELECT demo.DeviceCode, 'VITALS' FROM @Demo AS demo
+    INSERT dbo.HealthDevice (DeviceCode, DeviceType, IsDemo)
+    SELECT demo.DeviceCode, CASE demo.RowNo%4 WHEN 0 THEN 'FALL_RADAR' WHEN 2 THEN 'ECG_PATCH'
+           WHEN 3 THEN 'BP_MONITOR' ELSE 'VITALS' END, 1 FROM @Demo AS demo
     WHERE NOT EXISTS (SELECT 1 FROM dbo.HealthDevice AS d WHERE d.DeviceCode = demo.DeviceCode);
 
-    INSERT dbo.HealthBinding (DeviceId, ArchiveNo, StartsAt)
-    SELECT device.DeviceId, demo.ArchiveNo, DATEADD(day, -30, @Now)
+    INSERT dbo.HealthBinding (DeviceId, ArchiveNo, StartsAt, InstallationLocation)
+    SELECT device.DeviceId, demo.ArchiveNo, DATEADD(day, -30, @Now), N'演示居所'
     FROM @Demo AS demo JOIN dbo.HealthDevice AS device ON device.DeviceCode = demo.DeviceCode
     WHERE NOT EXISTS (SELECT 1 FROM dbo.HealthBinding AS b WHERE b.DeviceId = device.DeviceId);
+
+    INSERT dbo.HealthDevice(DeviceCode,DeviceType,IsDemo)
+    SELECT model.DeviceCode,model.DeviceType,1
+    FROM (VALUES ('DEMO-MODEL-BP','BP_MONITOR'),('DEMO-MODEL-ECG','ECG_PATCH'),
+                 ('DEMO-MODEL-FALL','FALL_RADAR'),('DEMO-MODEL-SOS','SOS')) model(DeviceCode,DeviceType)
+    WHERE NOT EXISTS (SELECT 1 FROM dbo.HealthDevice device WHERE device.DeviceCode=model.DeviceCode);
+    INSERT dbo.HealthBinding(DeviceId,ArchiveNo,StartsAt,InstallationLocation)
+    SELECT device.DeviceId,elder.ArchiveNo,DATEADD(day,-30,@Now),N'演示居所'
+    FROM dbo.HealthDevice device CROSS JOIN @Elders elder
+    WHERE elder.RowNo=1 AND device.IsDemo=1
+      AND device.DeviceCode IN ('DEMO-MODEL-BP','DEMO-MODEL-ECG','DEMO-MODEL-FALL','DEMO-MODEL-SOS')
+      AND NOT EXISTS (SELECT 1 FROM dbo.HealthBinding binding WHERE binding.DeviceId=device.DeviceId);
+
+    UPDATE device SET IsDemo=1
+    FROM dbo.HealthDevice device JOIN @Demo demo ON demo.DeviceCode=device.DeviceCode
+    WHERE device.IsDemo=0 AND EXISTS (
+        SELECT 1 FROM dbo.HealthBinding binding JOIN dbo.ElderArchive elder ON elder.ArchiveNo=binding.ArchiveNo
+        WHERE binding.DeviceId=device.DeviceId AND binding.EndsAt IS NULL
+          AND elder.ArchiveNo=demo.ArchiveNo AND LEFT(elder.IdNumber,6)='000000'
+    );
 
     INSERT dbo.HealthReading (BindingId, PacketKey, MetricCode, MeasuredValue, CapturedAt, ReceivedAt, SourceType, IsAbnormal)
     SELECT binding.BindingId, packet.PacketKey, demo.MetricCode, packet.MeasuredValue, binding.StartsAt, @Now, 'DEVICE', packet.IsAbnormal
@@ -88,12 +115,11 @@ BEGIN
     WHERE NOT EXISTS (SELECT 1 FROM dbo.HealthAlert AS a WHERE a.ReadingId = reading.ReadingId);
 
     INSERT dbo.HealthNotice (RecipientUserId, AlertId, Kind, CreatedAt)
-    SELECT account.UserId, alert.AlertId, 'TRIAGE', @Now
+    SELECT recipient.UserId, alert.AlertId, 'TRIAGE', @Now
     FROM @NewAlerts AS alert
     JOIN dbo.HealthReading AS reading ON reading.ReadingId = alert.ReadingId
     JOIN dbo.HealthBinding AS binding ON binding.BindingId = reading.BindingId
-    JOIN dbo.ElderArchive AS elder ON elder.ArchiveNo = binding.ArchiveNo
-    JOIN dbo.AppUser AS account ON account.Role = 'community' AND account.CommunityId = elder.CommunityId AND account.Active = 1;
+    CROSS APPLY dbo.fn_HealthNoticeRecipients(binding.ArchiveNo) AS recipient;
 
     INSERT dbo.HealthEvent (ArchiveNo, RequestKey, SourceType, Origin, Severity, OpenedAt, ResponseDeadline,
                             RespondedAt, RespondedBy, ArrivedAt, ClosedAt, Resolution, LastActorId)

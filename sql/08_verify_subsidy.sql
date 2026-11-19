@@ -14,11 +14,12 @@ SET XACT_ABORT ON;
 
 DECLARE @ClaimId int, @ArchiveNo varchar(20), @CommunityId int, @ServiceTypeId int, @PeriodMonth date;
 DECLARE @Creator int, @Street int, @Civil int, @BeforeStatus varchar(12), @BeforeLogCount int, @OrderIdsJson nvarchar(max);
+DECLARE @District nvarchar(80);
 
 SELECT TOP (1)
        @ClaimId = claim.ClaimId, @ArchiveNo = claim.ArchiveNo, @CommunityId = claim.CommunityId,
        @ServiceTypeId = claim.ServiceTypeId, @PeriodMonth = claim.PeriodMonth, @BeforeStatus = claim.Status,
-       @Creator = creator.UserId, @Street = street.UserId, @Civil = civil.UserId
+       @Creator = creator.UserId, @Street = street.UserId, @Civil = civil.UserId, @District = claim.District
 FROM dbo.v_SubsidyClaimSummary claim
 CROSS APPLY (
     SELECT TOP (1) UserId FROM dbo.AppUser WHERE Role = 'community' AND CommunityId = claim.CommunityId AND Active = 1
@@ -47,6 +48,41 @@ FROM dbo.SubsidyClaimOrder WHERE ClaimId = @ClaimId;
 
 BEGIN TRY
     BEGIN TRANSACTION;
+    EXEC dbo.usp_SaveSubsidyPolicy @Civil, N'验证普通对象', @District, @ServiceTypeId,
+        '20200101', '20991231', 10, 80, @BeneficiaryCategory='GENERAL';
+    EXEC dbo.usp_SaveSubsidyPolicy @Civil, N'验证低保对象', @District, @ServiceTypeId,
+        '20200101', '20991231', 20, 80, @BeneficiaryCategory='LOW_INCOME';
+    EXEC dbo.usp_SaveSubsidyPolicy @Civil, N'验证低保中度', @District, @ServiceTypeId,
+        '20200101', '20991231', 25, 80, @BeneficiaryCategory='LOW_INCOME', @AbilityLevel=N'中度失能';
+
+    UPDATE visit SET SubsidyCategory=NULL, SubsidyAbilityLevel=NULL FROM dbo.ServiceVisit visit
+    JOIN dbo.SubsidyClaimOrder line ON line.OrderId=visit.OrderId WHERE line.ClaimId=@ClaimId;
+    IF EXISTS (
+        SELECT 1 FROM dbo.SubsidyClaimOrder line
+        LEFT JOIN dbo.v_SubsidyApplicableOrder applicable ON applicable.OrderId=line.OrderId
+        LEFT JOIN dbo.SubsidyPolicy policy ON policy.PolicyId=applicable.PolicyId
+        WHERE line.ClaimId=@ClaimId AND (policy.PolicyId IS NULL OR policy.BeneficiaryCategory<>'ANY'
+            OR policy.AbilityLevel<>N'通用')
+    ) THROW 51840, N'无快照的旧订单只能匹配通用政策。', 1;
+
+    UPDATE visit SET SubsidyCategory='GENERAL', SubsidyAbilityLevel=N'中度失能' FROM dbo.ServiceVisit visit
+    JOIN dbo.SubsidyClaimOrder line ON line.OrderId=visit.OrderId WHERE line.ClaimId=@ClaimId;
+    IF EXISTS (
+        SELECT 1 FROM dbo.SubsidyClaimOrder line
+        LEFT JOIN dbo.v_SubsidyApplicableOrder applicable ON applicable.OrderId=line.OrderId
+        WHERE line.ClaimId=@ClaimId AND ISNULL(applicable.HourlyRate,0)<>10
+    ) THROW 51840, N'普通对象不能匹配低保专项。', 1;
+
+    UPDATE visit SET SubsidyCategory='LOW_INCOME', SubsidyAbilityLevel=N'轻度失能' FROM dbo.ServiceVisit visit
+    JOIN dbo.SubsidyClaimOrder line ON line.OrderId=visit.OrderId WHERE line.ClaimId=@ClaimId;
+    IF EXISTS (
+        SELECT 1 FROM dbo.SubsidyClaimOrder line
+        LEFT JOIN dbo.v_SubsidyApplicableOrder applicable ON applicable.OrderId=line.OrderId
+        WHERE line.ClaimId=@ClaimId AND ISNULL(applicable.HourlyRate,0)<>20
+    ) THROW 51840, N'无专项等级匹配时应使用该对象的通用等级政策。', 1;
+
+    UPDATE visit SET SubsidyAbilityLevel=N'中度失能' FROM dbo.ServiceVisit visit
+    JOIN dbo.SubsidyClaimOrder line ON line.OrderId=visit.OrderId WHERE line.ClaimId=@ClaimId;
     UPDATE dbo.SubsidyClaim SET Status = 'STREET', ChangeNote = N'验证退回与重新提交'
     WHERE ClaimId = @ClaimId;
     EXEC dbo.usp_ProgressSubsidyClaim @Street, @ClaimId, 'return', N'验证用街道退回原因';
@@ -54,6 +90,17 @@ BEGIN TRY
     EXEC dbo.usp_ProgressSubsidyClaim @Street, @ClaimId, 'approve', N'验证街道通过';
     EXEC dbo.usp_ProgressSubsidyClaim @Civil, @ClaimId, 'approve', N'验证民政通过';
     EXEC dbo.usp_ProgressSubsidyClaim @Civil, @ClaimId, 'pay', N'验证模拟拨付';
+    DECLARE @Today date = CONVERT(date,DATEADD(hour,8,SYSUTCDATETIME()));
+    EXEC dbo.usp_RecordAbilityAssessment 'VERIFY-SUBSIDY-REASSESS', @ArchiveNo, 'ADL', 75,
+        N'轻度失能', N'验证用复评', @Today, @Today;
+    UPDATE dbo.ElderArchive SET SubsidyCategory='GENERAL' WHERE ArchiveNo=@ArchiveNo;
+    IF EXISTS (
+        SELECT 1 FROM dbo.SubsidyClaimOrder line
+        LEFT JOIN dbo.v_SubsidyApplicableOrder applicable ON applicable.OrderId=line.OrderId
+        WHERE line.ClaimId=@ClaimId AND (line.HourlyRate<>25 OR ISNULL(applicable.HourlyRate,0)<>25
+            OR ISNULL(line.SubsidyCategory,'')<>'LOW_INCOME' OR ISNULL(line.SubsidyAbilityLevel,N'')<>N'中度失能'
+            OR applicable.Amount<>line.Amount)
+    ) THROW 51840, N'复评和档案类别变化不应改写本次申报的匹配和快照。', 1;
 
     IF NOT EXISTS (
         SELECT 1 FROM dbo.SubsidyClaim claim
@@ -69,9 +116,16 @@ BEGIN TRY
           AND ISJSON(OrderSnapshot, ARRAY) = 1 AND OrderSnapshot <> N'[]'
     )
         THROW 51832, N'退回时须保留订单和核算快照。', 1;
+    IF NOT EXISTS (
+        SELECT 1 FROM dbo.SubsidyClaimLog log CROSS APPLY OPENJSON(log.OrderSnapshot) snapshot
+        WHERE log.ClaimId=@ClaimId AND log.CurrentStatus='PAID'
+          AND JSON_VALUE(snapshot.value, '$.SubsidyCategory')='LOW_INCOME'
+          AND JSON_VALUE(snapshot.value, '$.SubsidyAbilityLevel')=N'中度失能'
+    ) THROW 51832, N'核算对象类别和等级须进入审核快照。', 1;
 
-    DECLARE @OrderId int, @QualityActor int, @AgencyActor int, @InspectionId int, @RestrictionId int;
-    SELECT TOP (1) @OrderId = visit.OrderId, @QualityActor = supervisor.UserId, @AgencyActor = manager.UserId
+    DECLARE @OrderId int, @QualityActor int, @AgencyActor int, @InspectionId int, @RestrictionId int, @WorkerId int;
+    SELECT TOP (1) @OrderId = visit.OrderId, @QualityActor = supervisor.UserId, @AgencyActor = manager.UserId,
+        @WorkerId = visit.WorkerId
     FROM dbo.v_SubsidyEligibleOrder visit
     JOIN dbo.ServiceOrder orders ON orders.OrderId = visit.OrderId
     JOIN dbo.Community community ON community.CommunityId = visit.CommunityId
@@ -88,9 +142,13 @@ BEGIN TRY
 
     IF @OrderId IS NULL
         THROW 51833, N'未找到带机构账号的模拟完成订单。', 1;
-    EXEC dbo.usp_RegisterInspection @QualityActor, 'order', @OrderId, 55, N'验证用抽查';
+    DECLARE @InspectionMonth char(7) = CONVERT(char(7), @Today, 126), @ClosedBefore bigint;
+    SELECT @ClosedBefore=COALESCE(SUM(ClosedCount),0) FROM dbo.v_MonthlyInspectionResults
+        WHERE WorkerId=@WorkerId AND InspectionMonth=@InspectionMonth;
+    EXEC dbo.usp_RegisterInspection @QualityActor, 'order', @OrderId, 55, N'验证用抽查', 'PHONE', N'记录', N'核对并补全记录';
     SELECT TOP (1) @InspectionId = InspectionId, @RestrictionId = RestrictionId
     FROM dbo.ServiceInspection WHERE OrderId = @OrderId AND Finding = N'验证用抽查'
+        AND InspectionMethod='PHONE' AND IssueTag=N'记录'
     ORDER BY InspectionId DESC;
     IF @RestrictionId IS NULL OR NOT EXISTS (
         SELECT 1 FROM dbo.WorkerRestriction WHERE RestrictionId = @RestrictionId AND ResolvedAt IS NULL
@@ -107,12 +165,27 @@ BEGIN TRY
         SELECT 1 FROM dbo.WorkerRestriction WHERE RestrictionId = @RestrictionId AND ResolvedAt IS NOT NULL
     )
         THROW 51836, N'复查通过应解除本次抽查的限制。', 1;
+    IF (SELECT COALESCE(SUM(ClosedCount),0) FROM dbo.v_MonthlyInspectionResults
+            WHERE WorkerId=@WorkerId AND InspectionMonth=@InspectionMonth) <> @ClosedBefore+1
+        THROW 51836, N'复查结案应计入抽查月份的整改考核。', 1;
 
     ROLLBACK TRANSACTION;
 END TRY
 BEGIN CATCH
     IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
     THROW;
+END CATCH;
+
+BEGIN TRY
+    BEGIN TRANSACTION;
+    EXEC dbo.usp_SaveSubsidyPolicy @Civil, N'验证同组重叠', @District, @ServiceTypeId,
+        '20200102', '20991231', 20, 80;
+    ROLLBACK TRANSACTION;
+    THROW 51840, N'同组政策不允许有效期重叠。', 1;
+END TRY
+BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+    IF ERROR_NUMBER() <> 51803 THROW;
 END CATCH;
 
 IF NOT EXISTS (SELECT 1 FROM dbo.SubsidyClaim WHERE ClaimId = @ClaimId AND Status = @BeforeStatus)

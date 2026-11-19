@@ -237,6 +237,21 @@ IF COL_LENGTH('dbo.ServiceVisit', 'ComplaintText') IS NULL
         ComplaintResolvedAt datetime2(0) NULL, ComplaintResolvedBy int NULL;
 IF COL_LENGTH('dbo.Worker', 'TrainingCompletedOn') IS NULL
     ALTER TABLE dbo.Worker ADD TrainingCompletedOn date NULL;
+IF COL_LENGTH('dbo.ServiceType', 'CategoryCode') IS NULL
+    ALTER TABLE dbo.ServiceType ADD CategoryCode varchar(12) NULL
+        CONSTRAINT CK_ServiceType_Category CHECK (CategoryCode IN ('MEAL','BATH','ESCORT','HOUSEWORK','REHAB'));
+IF COL_LENGTH('dbo.WorkerService', 'CredentialType') IS NULL
+    ALTER TABLE dbo.WorkerService ADD CredentialType nvarchar(40) NULL, CredentialLevel nvarchar(40) NULL;
+IF COL_LENGTH('dbo.ServiceDispatch', 'TimeoutFollowedUpAt') IS NULL
+    ALTER TABLE dbo.ServiceDispatch ADD TimeoutFollowedUpAt datetime2(0) NULL,
+        TimeoutFollowedUpBy int NULL REFERENCES dbo.AppUser(UserId), TimeoutFollowupNote nvarchar(250) NULL;
+IF COL_LENGTH('dbo.ServiceVisit', 'SubsidyCategory') IS NULL
+    ALTER TABLE dbo.ServiceVisit ADD SubsidyCategory varchar(12) NULL, SubsidyAbilityLevel nvarchar(20) NULL,
+        CONSTRAINT CK_ServiceVisit_SubsidyBasis CHECK (
+            (SubsidyCategory IS NULL AND SubsidyAbilityLevel IS NULL)
+            OR (SubsidyCategory IS NOT NULL AND SubsidyCategory IN ('GENERAL','LOW_INCOME')
+                AND SubsidyAbilityLevel IS NOT NULL)
+        );
 GO
 
 CREATE OR ALTER FUNCTION dbo.fn_ServiceConfirmationHash(
@@ -285,8 +300,11 @@ BEGIN
     FROM inserted i LEFT JOIN deleted d ON d.OrderId = i.OrderId
     WHERE d.OrderId IS NULL OR d.WorkStatus <> i.WorkStatus;
     INSERT dbo.ServiceVisitAudit(OrderId, OldStatus, NewStatus, Reason)
-    SELECT i.OrderId, i.WorkStatus, i.WorkStatus, N'家属签字完成'
+    SELECT i.OrderId, i.WorkStatus, i.WorkStatus,
+           CASE signer.Role WHEN 'resident' THEN N'老人本人签字完成' WHEN 'family' THEN N'家属签字完成'
+               ELSE N'服务签字完成' END
     FROM inserted i LEFT JOIN deleted d ON d.OrderId = i.OrderId
+    LEFT JOIN dbo.AppUser signer ON signer.UserId = i.ConfirmedBy
     WHERE d.ConfirmedAt IS NULL AND i.ConfirmedAt IS NOT NULL;
     INSERT dbo.ServiceVisitAudit(OrderId, OldStatus, NewStatus, Reason)
     SELECT i.OrderId, i.WorkStatus, i.WorkStatus,
@@ -316,7 +334,8 @@ SELECT o.OrderId, o.OrderNo, o.ArchiveNo, e.FullName, o.PlanId, o.ServiceTypeId,
        o.Address, o.Latitude, o.Longitude, o.Channel, o.CreatedAt, o.DispatchDeadline, o.ReviewReason,
        d.DispatchId, d.WorkerId, w.Name AS WorkerName, w.AgencyId, d.OfferExpiresAt, d.ClosedAt,
        v.CheckInAt, v.CheckOutAt, v.WorkStatus, v.EffectiveMinutes, v.ConfirmedAt, v.FeedbackScore, v.Feedback,
-       v.ComplaintText, v.ComplainedAt, v.ComplaintResolution, v.ComplaintResolvedAt
+       v.ComplaintText, v.ComplainedAt, v.ComplaintResolution, v.ComplaintResolvedAt,
+       v.ServiceRecord, t.Subsidizable
 FROM dbo.ServiceOrder o
 JOIN dbo.ElderArchive e ON e.ArchiveNo = o.ArchiveNo
 JOIN dbo.Community c ON c.CommunityId = o.CommunityId
@@ -329,7 +348,7 @@ GO
 CREATE OR ALTER VIEW dbo.v_ServiceDispatchHistory AS
 SELECT d.DispatchId, d.OrderId, d.WorkerId, w.Name AS WorkerName, w.AgencyId, d.ShiftId,
        d.OfferedAt, d.OfferExpiresAt, d.AcceptedAt, d.ClosedAt, d.CloseReason,
-       o.ArchiveNo, o.CommunityId, c.District
+       o.ArchiveNo, o.CommunityId, c.District, d.TimeoutFollowedUpAt, d.TimeoutFollowupNote
 FROM dbo.ServiceDispatch d JOIN dbo.Worker w ON w.WorkerId = d.WorkerId
 JOIN dbo.ServiceOrder o ON o.OrderId = d.OrderId JOIN dbo.Community c ON c.CommunityId = o.CommunityId;
 GO
@@ -369,7 +388,7 @@ GO
 
 CREATE OR ALTER VIEW dbo.v_SubsidyEligibleOrder AS
 SELECT o.OrderId, o.ArchiveNo, o.ServiceTypeId, o.CommunityId, v.WorkerId, w.AgencyId,
-       v.ConfirmedAt, v.CheckOutAt, v.EffectiveMinutes, o.Price
+       v.ConfirmedAt, v.CheckOutAt, v.EffectiveMinutes, o.Price, v.SubsidyCategory, v.SubsidyAbilityLevel
 FROM dbo.ServiceOrder o JOIN dbo.ServiceVisit v ON v.OrderId = o.OrderId
 JOIN dbo.Worker w ON w.WorkerId = v.WorkerId JOIN dbo.ServiceType t ON t.ServiceTypeId = o.ServiceTypeId
 WHERE o.Status = 'COMPLETED' AND t.Subsidizable = 1 AND v.WorkStatus = 'VALID'
@@ -592,22 +611,30 @@ BEGIN
                                AND s.ValidFrom <= @Today AND s.ValidThrough >= @Today AND w.IsActive = 1)
                 OR EXISTS (SELECT 1 FROM dbo.WorkerRestriction WHERE WorkerId = @WorkerId AND ResolvedAt IS NULL)
                 THROW 51214, N'护工资质失效或尚有整改限制。', 1;
-            INSERT dbo.ServiceVisit(OrderId, DispatchId, WorkerId, CheckInAt, InLatitude, InLongitude, InFence, InShift, WorkStatus)
-            VALUES (@OrderId, @DispatchId, @WorkerId, @Now, @Latitude, @Longitude, @InFence, @InShift, 'OPEN');
+            INSERT dbo.ServiceVisit(OrderId, DispatchId, WorkerId, CheckInAt, InLatitude, InLongitude, InFence, InShift,
+                                    WorkStatus, SubsidyCategory, SubsidyAbilityLevel)
+            SELECT @OrderId, @DispatchId, @WorkerId, @Now, @Latitude, @Longitude, @InFence, @InShift,
+                   'OPEN', SubsidyCategory, @AbilityLevel
+            FROM dbo.ElderArchive WHERE ArchiveNo = @ArchiveNo;
             UPDATE dbo.ServiceOrder SET Status = 'IN_SERVICE' WHERE OrderId = @OrderId;
         END
         ELSE
         BEGIN
             IF @Status <> 'IN_SERVICE' OR @Reason IS NULL
                 THROW 51217, N'服务进行中才能签退，签退需要填写服务记录。', 1;
-            UPDATE dbo.ServiceVisit SET CheckOutAt = @Now, OutLatitude = @Latitude, OutLongitude = @Longitude,
+            UPDATE visit SET CheckOutAt = @Now, OutLatitude = @Latitude, OutLongitude = @Longitude,
                 OutFence = @InFence, OutShift = @InShift, ServiceRecord = @Reason,
                 ExpiredDuringVisit = IIF(@AssessmentValidThrough >= @Today, ExpiredDuringVisit, 1),
-                WorkStatus = IIF(InFence = 1 AND InShift = 1 AND @InFence = 1 AND @InShift = 1, 'VALID', 'REVIEW'),
-                EffectiveMinutes = IIF(InFence = 1 AND InShift = 1 AND @InFence = 1 AND @InShift = 1,
-                    DATEDIFF(minute, CheckInAt, @Now), NULL),
-                ReviewReason = IIF(InFence = 1 AND InShift = 1 AND @InFence = 1 AND @InShift = 1, NULL, N'签到或签退不符合定位围栏或班次范围')
-            WHERE OrderId = @OrderId AND CheckOutAt IS NULL;
+                WorkStatus = IIF(review.Reason IS NULL, 'VALID', 'REVIEW'),
+                EffectiveMinutes = IIF(review.Reason IS NULL, DATEDIFF(minute, visit.CheckInAt, @Now), NULL),
+                ReviewReason = review.Reason
+            FROM dbo.ServiceVisit visit
+            CROSS APPLY (VALUES (NULLIF(CONCAT_WS(N'；',
+                CASE WHEN @Now > @End THEN N'签退晚于预约结束时间' END,
+                CASE WHEN visit.InFence = 0 OR @InFence = 0 THEN N'签到或签退超出定位围栏' END,
+                CASE WHEN visit.InShift = 0 OR @InShift = 0 THEN N'签到或签退超出班次范围' END
+            ), N''))) review(Reason)
+            WHERE visit.OrderId = @OrderId AND visit.CheckOutAt IS NULL;
             UPDATE dbo.ServiceDispatch SET ClosedAt = @Now, CloseReason = N'服务完成' WHERE DispatchId = @DispatchId;
             UPDATE dbo.ServiceOrder SET Status = 'AWAITING_CONFIRMATION' WHERE OrderId = @OrderId;
         END;
@@ -615,10 +642,10 @@ BEGIN
     ELSE IF @Action = 'CONFIRM'
     BEGIN
         IF @Status <> 'AWAITING_CONFIRMATION' OR @Reason IS NULL OR NOT EXISTS (
-            SELECT 1 FROM dbo.AppUser WHERE UserId = @ActorId AND Role = 'family'
+            SELECT 1 FROM dbo.AppUser WHERE UserId = @ActorId AND Role IN ('family','resident')
                 AND Active = 1 AND ArchiveNo = @ArchiveNo
         )
-            THROW 51218, N'仅待确认的服务可由家属签字。', 1;
+            THROW 51218, N'仅待确认的服务可由老人本人或关联家属签字。', 1;
         UPDATE dbo.ServiceVisit SET ConfirmedAt = @Now, ConfirmedBy = @ActorId, ConfirmationText = LEFT(@Reason, 200),
             ConfirmationHash = dbo.fn_ServiceConfirmationHash(@OrderId, @ActorId, @Now, LEFT(@Reason, 200))
         WHERE OrderId = @OrderId AND CheckOutAt IS NOT NULL AND ServiceRecord IS NOT NULL AND ConfirmedAt IS NULL;
@@ -800,21 +827,51 @@ END;
 GO
 
 CREATE OR ALTER PROCEDURE dbo.usp_SetWorkerCredential @WorkerId int, @ServiceTypeId int,
-    @CredentialNo nvarchar(60), @ValidFrom date, @ValidThrough date AS
+    @CredentialNo nvarchar(60), @ValidFrom date, @ValidThrough date,
+    @CredentialType nvarchar(40) = NULL, @CredentialLevel nvarchar(40) = NULL AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
     DECLARE @WorkerKey nvarchar(40) = CONVERT(nvarchar(40), @WorkerId);
-    IF NULLIF(TRIM(@CredentialNo), N'') IS NULL OR @ValidThrough < @ValidFrom
+    IF NULLIF(TRIM(@CredentialNo), N'') IS NULL OR @ValidFrom IS NULL OR @ValidThrough IS NULL
+       OR @ValidThrough < @ValidFrom
         THROW 51208, N'请填写有效证书编号和日期。', 1;
+    SET @CredentialType = NULLIF(TRIM(@CredentialType), N'');
+    SET @CredentialLevel = NULLIF(TRIM(@CredentialLevel), N'');
+    IF (@CredentialType IS NULL AND @CredentialLevel IS NOT NULL)
+       OR (@CredentialType IS NOT NULL AND @CredentialLevel IS NULL)
+        THROW 51208, N'证书类型和等级应同时填写。', 1;
     BEGIN TRANSACTION;
     EXEC dbo.usp_ServiceLock 'worker', @WorkerKey;
-    UPDATE dbo.WorkerService SET CredentialNo = @CredentialNo, ValidFrom = @ValidFrom, ValidThrough = @ValidThrough
+    UPDATE dbo.WorkerService SET CredentialNo = @CredentialNo, ValidFrom = @ValidFrom, ValidThrough = @ValidThrough,
+        CredentialType = COALESCE(@CredentialType, CredentialType), CredentialLevel = COALESCE(@CredentialLevel, CredentialLevel)
     WHERE WorkerId = @WorkerId AND ServiceTypeId = @ServiceTypeId;
     IF @@ROWCOUNT = 0
-        INSERT dbo.WorkerService(WorkerId, ServiceTypeId, CredentialNo, ValidFrom, ValidThrough)
-        VALUES (@WorkerId, @ServiceTypeId, @CredentialNo, @ValidFrom, @ValidThrough);
+        INSERT dbo.WorkerService(WorkerId, ServiceTypeId, CredentialNo, ValidFrom, ValidThrough, CredentialType, CredentialLevel)
+        VALUES (@WorkerId, @ServiceTypeId, @CredentialNo, @ValidFrom, @ValidThrough, @CredentialType, @CredentialLevel);
     COMMIT;
+END;
+GO
+
+CREATE OR ALTER PROCEDURE dbo.usp_FollowUpDispatchTimeout
+    @ActorId int, @DispatchId int, @Note nvarchar(250)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    IF NULLIF(TRIM(@Note), N'') IS NULL
+        THROW 51225, N'请填写机构跟进说明。', 1;
+    UPDATE dispatch SET TimeoutFollowedUpAt=SYSUTCDATETIME(), TimeoutFollowedUpBy=@ActorId,
+        TimeoutFollowupNote=TRIM(@Note)
+    FROM dbo.ServiceDispatch dispatch
+    JOIN dbo.Worker worker ON worker.WorkerId=dispatch.WorkerId
+    JOIN dbo.AppUser actor ON actor.UserId=@ActorId AND actor.Role='agency' AND actor.Active=1
+        AND actor.AgencyId=worker.AgencyId
+    WHERE dispatch.DispatchId=@DispatchId AND dispatch.AcceptedAt IS NULL
+      AND dispatch.ClosedAt>=dispatch.OfferExpiresAt AND dispatch.CloseReason=N'派单超过接单时限'
+      AND dispatch.TimeoutFollowedUpAt IS NULL;
+    IF @@ROWCOUNT<>1
+        THROW 51225, N'派单不属于本机构、未超时或已有跟进记录。', 1;
 END;
 GO
 

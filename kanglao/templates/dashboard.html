@@ -16,6 +16,20 @@
     {% endfor %}
   </div>
 </section>
+{% if reassessments is not none %}
+<section class="panel dashboard-section" aria-labelledby="reassessments">
+  <header><h2 id="reassessments">待复评</h2><p>今日至未来 14 天内到期的评估</p></header>
+  <div class="table-scroll" tabindex="0" role="region" aria-label="待复评表格">
+    <table>
+      <thead><tr><th scope="col">档案编号</th><th scope="col">姓名</th><th scope="col">能力等级</th><th scope="col">截止日期</th></tr></thead>
+      <tbody>{% for row in reassessments %}
+        <tr><td><a href="{{ url_for('archive.detail', archive_no=row.ArchiveNo) }}">{{ row.ArchiveNo }}</a></td>
+            <td>{{ row.FullName }}</td><td>{{ row.AbilityLevel }}</td><td>{{ row.ValidThrough }}</td></tr>
+      {% else %}<tr><td class="empty" colspan="4">暂无即将到期的评估</td></tr>{% endfor %}</tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
 {% if recent %}
 <section class="panel dashboard-section" aria-labelledby="recent">
   <header><h2 id="recent">近期评估</h2></header>

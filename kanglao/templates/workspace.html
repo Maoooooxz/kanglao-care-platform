@@ -23,6 +23,18 @@
           <button class="secondary" type="submit">搜索</button>
         </form>
       {% endif %}
+      {% if panel.status_filter %}
+        <form method="get" class="search">
+          <label for="{{ panel_id }}-status">订单状态</label>
+          <select id="{{ panel_id }}-status" name="status">
+            <option value="">全部状态</option>
+            {% for value, label in panel.status_filter.options %}
+            <option value="{{ value }}"{% if value == panel.status_filter.value %} selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+          <button class="secondary" type="submit">筛选</button>
+        </form>
+      {% endif %}
       {% if panel.columns %}
         <div class="table-scroll" tabindex="0" role="region" aria-label="{{ panel.title }}表格">
           <table><thead><tr>{% for col in panel.columns %}<th scope="col">{{ col }}</th>{% endfor %}</tr></thead>

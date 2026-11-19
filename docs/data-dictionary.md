@@ -36,6 +36,28 @@
 - PK `PK__Agency__95C546DB078D7193` · `AgencyId`
 - UNIQUE `UQ__Agency__95C0E84A43E429DC` · `AgencyNo`
 
+## AgencyAssessmentSubmission
+
+| 字段 | 类型 | 可空 | 默认值或属性 |
+|---|---|---|---|
+| SubmissionId | int | 否 | 自增主键 |
+| AgencyId | int | 否 | 外键：Agency |
+| District | nvarchar(80) | 否 | 接收监管辖区快照 |
+| PeriodMonth | date | 否 | 月份首日；与机构组成唯一键 |
+| InspectionCount | bigint | 否 | 实际检查次数 |
+| ScoreTotal | bigint | 否 | 检查得分之和 |
+| RequiredCount | bigint | 否 | 要求整改的次数 |
+| ClosedCount | bigint | 否 | 整改结案次数 |
+| ComplaintCount | bigint | 否 | 本月投诉数 |
+| EffectiveMinutes | bigint | 否 | 本月有效工时分钟 |
+| SubmittedBy | int | 否 | 外键：AppUser |
+| SubmittedAt | datetime2(0) | 否 | UTC，默认当前时间 |
+| ReviewedBy | int | 是 | 外键：AppUser |
+| ReviewedAt | datetime2(0) | 是 | UTC |
+| ReviewNote | nvarchar(250) | 是 | 与审阅人和审阅时间同时为空或有值 |
+
+统计数量非负，结案数不超过整改数，整改数不超过检查数，得分不超过检查次数乘以 100。
+
 ## AppUser
 
 | 字段 | 类型 | 可空 | 默认值或属性 |
@@ -167,6 +189,7 @@
 | Latitude | decimal(9,6) | 否 |  `((40.008000))` |
 | Longitude | decimal(9,6) | 否 |  `((116.341000))` |
 | Tags | nvarchar(200) | 是 |   |
+| SubsidyCategory | varchar(12) | 否 | `GENERAL`（普通，默认）或 `LOW_INCOME`（低保） |
 
 - FK `FK_ElderArchive_Community` · `CommunityId -> Community(CommunityId)`
 - PK `PK_ElderArchive` · `IdNumber`
@@ -203,6 +226,7 @@
 | ArchiveNo | varchar(20) | 否 |   |
 | StartsAt | datetime2(0) | 否 |   |
 | EndsAt | datetime2(0) | 是 |   |
+| InstallationLocation | nvarchar(120) | 是 | 该次绑定的安装位置，旧绑定可能未记录 |
 
 - FK `FK__HealthBin__Archi__0F2D40CE` · `ArchiveNo -> ElderArchive(ArchiveNo)`
 - FK `FK__HealthBin__Devic__0E391C95` · `DeviceId -> HealthDevice(DeviceId)`
@@ -219,10 +243,11 @@
 | DeviceCode | varchar(24) | 否 |   |
 | DeviceType | varchar(12) | 否 |   |
 | IsEnabled | bit | 否 |  `((1))` |
+| IsDemo | bit | 否 | 默认 0；只有演示设备可由本地模拟器上报 |
 
 - PK `PK__HealthDe__49E12311D63A984B` · `DeviceId`
 - UNIQUE `UQ__HealthDe__AFFB3E95D2A0E075` · `DeviceCode`
-- CHECK `CK__HealthDev__Devic__09746778` · `([DeviceType]='SOS' OR [DeviceType]='VITALS')`
+- CHECK `CK_HealthDevice_Type` · `SOS`、`BP_MONITOR`、`ECG_PATCH`、`FALL_RADAR`、兼容旧值 `VITALS`。
 
 ## HealthEvent
 
@@ -244,6 +269,8 @@
 | Resolution | nvarchar(400) | 是 |   |
 | EscalatedAt | datetime2(0) | 是 |   |
 | LastActorId | int | 是 |   |
+| ReportKind | varchar(12) | 是 | 人工上报：`HEALTH` 或 `HOME_RISK` |
+| ReportText | nvarchar(400) | 是 | 人工上报分类与说明同时留空或有效 |
 
 - FK `FK__HealthEve__Alert__2DB1C7EE` · `AlertId -> HealthAlert(AlertId)`
 - FK `FK__HealthEve__Archi__2CBDA3B5` · `ArchiveNo -> ElderArchive(ArchiveNo)`
@@ -349,6 +376,42 @@
 - CHECK `CK__HealthThr__Triag__12FDD1B2` · `([TriageMinutes]>(0))`
 - CHECK `CK__HealthThreshold__14E61A24` · `([MaximumValue]>=[MinimumValue])`
 
+## InspectionBatch
+
+| 字段 | 类型 | 可空 | 默认值或属性 |
+|---|---|---|---|
+| BatchId | int | 否 | 自增主键 |
+| ReviewDistrict | nvarchar(80) | 否 | 抽查辖区 |
+| PeriodMonth | date | 否 | 服务月份首日，与辖区组成唯一键 |
+| SampleRate | tinyint | 否 | 百分比 1–100 |
+| PopulationCount | int | 否 | 生成时辖区完成订单总体 |
+| TargetCount | int | 否 | 对总体按比例向上取整；不能超过总体 |
+| CreatedBy | int | 否 | 外键：AppUser |
+| CreatedAt | datetime2(0) | 否 | UTC，默认当前时间 |
+
+## InspectionBatchOrder
+
+| 字段 | 类型 | 可空 | 默认值或属性 |
+|---|---|---|---|
+| BatchId | int | 否 | 外键：InspectionBatch |
+| OrderId | int | 否 | 外键：ServiceOrder |
+
+联合主键为 `BatchId, OrderId`，重复生成时不替换既有样本。
+
+## InspectionPublication
+
+| 字段 | 类型 | 可空 | 默认值或属性 |
+|---|---|---|---|
+| BatchId | int | 否 | 主键兼外键：InspectionBatch |
+| InspectionCount | bigint | 否 | 公示时已检查的样本数，至少 1 |
+| ScoreTotal | bigint | 否 | 样本分数加总 |
+| RequiredCount | bigint | 否 | 需整改数 |
+| ClosedCount | bigint | 否 | 公示时已结案的整改数 |
+| PublishedBy | int | 否 | 外键：AppUser；仅本辖区民政可发布 |
+| PublishedAt | datetime2(0) | 否 | UTC，默认当前时间 |
+
+公示快照不含个人和订单明细。一批至多发布一次。
+
 ## ServiceDispatch
 
 | 字段 | 类型 | 可空 | 默认值或属性 |
@@ -362,6 +425,9 @@
 | AcceptedAt | datetime2(0) | 是 |   |
 | ClosedAt | datetime2(0) | 是 |   |
 | CloseReason | nvarchar(250) | 是 |   |
+| TimeoutFollowedUpAt | datetime2(0) | 是 | 机构处理超时记录的时间 |
+| TimeoutFollowedUpBy | int | 是 | 外键：AppUser |
+| TimeoutFollowupNote | nvarchar(250) | 是 | 机构说明；不改变状态或重派权限 |
 
 - FK `FK__ServiceDi__Order__4A8310C6` · `OrderId -> ServiceOrder(OrderId)`
 - FK `FK__ServiceDi__Shift__4C6B5938` · `ShiftId -> WorkerShift(ShiftId)`
@@ -404,6 +470,9 @@
 | CorrectedAt | datetime2(0) | 是 |   |
 | ClosedAt | datetime2(0) | 是 |   |
 | ChangedBy | int | 是 |   |
+| InspectionMethod | varchar(10) | 是 | `PHONE`（电话回访）或 `VISIT`（上门核查）；旧记录可为空 |
+| IssueTag | nvarchar(60) | 是 | 可选问题标签 |
+| CorrectionRequirement | nvarchar(250) | 是 | 新增低于 60 分的抽查必须填写，历史可为空 |
 
 - FK `FK__ServiceIn__Chang__093F5D4E` · `ChangedBy -> AppUser(UserId)`
 - FK `FK__ServiceIn__Inspe__075714DC` · `InspectorId -> AppUser(UserId)`
@@ -476,6 +545,7 @@
 | Rate | decimal(10,2) | 否 |   |
 | StandardMinutes | smallint | 否 |   |
 | Subsidizable | bit | 否 |  `((1))` |
+| CategoryCode | varchar(12) | 是 | 助餐、助浴、陪诊、家政、康复护理；旧记录可为空 |
 
 - PK `PK__ServiceT__8ADFAA6C80D5876F` · `ServiceTypeId`
 - UNIQUE `UQ__ServiceT__737584F62A846AA3` · `Name`
@@ -510,6 +580,8 @@
 | ConfirmedBy | int | 是 |   |
 | ConfirmationText | nvarchar(200) | 是 |   |
 | ConfirmationHash | varbinary(32) | 是 |   |
+| SubsidyCategory | varchar(12) | 是 | 签到时的补贴对象类别；与等级快照同时有值或同时为空 |
+| SubsidyAbilityLevel | nvarchar(20) | 是 | 签到时有效评估的能力等级；旧记录可为空 |
 | FeedbackScore | tinyint | 是 |   |
 | Feedback | nvarchar(300) | 是 |   |
 | ComplaintText | nvarchar(300) | 是 |   |
@@ -588,6 +660,7 @@
 | Note | nvarchar(250) | 否 |   |
 | TotalAmount | decimal(14,2) | 否 |   |
 | OrderSnapshot | nvarchar(max) | 否 |   |
+| EvidenceSnapshot | nvarchar(max) | 是 | 每次提交时生成的 JSON 数组；旧版本无证明快照 |
 
 - FK `FK__SubsidyCl__Actor__019E3B86` · `ActorId -> AppUser(UserId)`
 - FK `FK__SubsidyCl__Claim__00AA174D` · `ClaimId -> SubsidyClaim(ClaimId)`
@@ -607,6 +680,8 @@
 | HourlyRate | decimal(10,2) | 否 |   |
 | MaxPerOrder | decimal(10,2) | 否 |   |
 | Amount | decimal(14,2) | 否 |   |
+| SubsidyCategory | varchar(12) | 是 | 本次申报使用的对象类别快照 |
+| SubsidyAbilityLevel | nvarchar(20) | 是 | 本次申报使用的能力等级快照 |
 
 - FK `FK__SubsidyCl__Claim__7AF13DF7` · `ClaimId -> SubsidyClaim(ClaimId)`
 - FK `FK__SubsidyCl__Order__7BE56230` · `OrderId -> ServiceOrder(OrderId)`
@@ -627,10 +702,13 @@
 | ValidThrough | date | 否 |   |
 | HourlyRate | decimal(10,2) | 否 |   |
 | MaxPerOrder | decimal(10,2) | 否 |   |
+| BeneficiaryCategory | varchar(12) | 否 | `ANY`（通用，默认）、`GENERAL` 或 `LOW_INCOME` |
+| AbilityLevel | nvarchar(20) | 否 | 五种能力等级或「通用」（默认） |
+| SettlementCycle | varchar(8) | 否 | `MONTH`，北京时间自然月 |
 
 - FK `FK__SubsidyPo__Servi__68D28DBC` · `ServiceTypeId -> ServiceType(ServiceTypeId)`
 - PK `PK__SubsidyP__2E1339A46B40CC65` · `PolicyId`
-- UNIQUE `UQ_SubsidyPolicy_Start` · `District, ServiceTypeId, ValidFrom`
+- UNIQUE `UQ_SubsidyPolicy_BasisStart` · `District, ServiceTypeId, BeneficiaryCategory, AbilityLevel, ValidFrom`
 - CHECK `CK_SubsidyPolicy_Dates` · `([ValidThrough]>=[ValidFrom])`
 - CHECK `CK_SubsidyPolicy_Rates` · `([HourlyRate]>(0) AND [MaxPerOrder]>(0))`
 
@@ -686,6 +764,8 @@
 | CredentialNo | nvarchar(60) | 否 |   |
 | ValidFrom | date | 否 |   |
 | ValidThrough | date | 否 |   |
+| CredentialType | nvarchar(40) | 是 | 证书类型；旧记录可为空 |
+| CredentialLevel | nvarchar(40) | 是 | 证书等级；旧记录可为空 |
 
 - FK `FK__WorkerSer__Servi__18EBB532` · `ServiceTypeId -> ServiceType(ServiceTypeId)`
 - FK `FK__WorkerSer__Worke__17F790F9` · `WorkerId -> Worker(WorkerId)`

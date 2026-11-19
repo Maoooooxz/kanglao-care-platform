@@ -1,8 +1,10 @@
+from datetime import timedelta
+
 from flask import Blueprint, g, render_template
 
 from .archive import READERS, archive_scope
 from .db import one, query
-from .web import roles
+from .web import beijing_today, roles
 
 bp = Blueprint("home", __name__)
 WORKSPACES = [
@@ -12,6 +14,7 @@ WORKSPACES = [
     ("人员与排班", "/services/workers", "班", "护工资质、排班与工时复核", ("community", "caregiver", "agency", "street", "civil")),
     ("健康与应急", "/health/", "健", "监测设备、异常与应急响应", ("community", "family", "resident", "caregiver", "agency", "street", "civil")),
     ("补贴与抽查", "/subsidy/", "补", "补贴申报、分级审核和服务监管", ("community", "family", "resident", "caregiver", "agency", "street", "civil")),
+    ("抽查公示", "/oversight/bulletins", "公", "查看已发布的脱敏抽查汇总", ("community", "family", "resident", "caregiver", "agency", "street", "civil")),
 ]
 
 
@@ -27,6 +30,7 @@ def navigation():
 def index():
     stats = []
     recent = []
+    reassessments = None
     if g.user["role"] in READERS:
         scope, params = archive_scope()
         data = one(
@@ -43,6 +47,14 @@ def index():
             "JOIN dbo.v_CurrentAbilityAssessment a ON a.ArchiveNo=e.ArchiveNo "
             f"WHERE e.IsActive=1 AND {scope} ORDER BY a.AssessmentDate DESC,e.ArchiveNo", *params,
         )
+        if g.user["role"] == "community":
+            today = beijing_today()
+            reassessments = query(
+                "SELECT e.ArchiveNo,e.FullName,a.AbilityLevel,a.ValidThrough "
+                "FROM dbo.ElderArchive e JOIN dbo.v_CurrentAbilityAssessment a ON a.ArchiveNo=e.ArchiveNo "
+                "WHERE e.IsActive=1 AND e.CommunityId=? AND a.ValidThrough BETWEEN ? AND ? "
+                "ORDER BY a.ValidThrough,e.ArchiveNo", g.user["community_id"], today, today + timedelta(days=14),
+            )
     elif g.user["role"] == "agency":
         count = one("SELECT COUNT(*) AS n FROM dbo.Worker WHERE AgencyId=?", g.user["agency_id"])
         stats = [("机构护工", count["n"])]
@@ -50,4 +62,4 @@ def index():
         count = one("SELECT COUNT(*) AS n FROM dbo.WorkerRestriction WHERE WorkerId=? AND ResolvedAt IS NULL",
                     g.user["worker_id"])
         stats = [("待整改事项", count["n"])]
-    return render_template("dashboard.html", title="工作台", stats=stats, recent=recent)
+    return render_template("dashboard.html", title="工作台", stats=stats, recent=recent, reassessments=reassessments)

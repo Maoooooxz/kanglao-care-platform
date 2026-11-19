@@ -1,10 +1,11 @@
-from datetime import timezone
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 
 from flask import Blueprint, flash, g, redirect, request, url_for
 from mssql_python import Error
 
+from .archive import bounded
 from .db import execute, query
 from .web import SHANGHAI, field, local_datetime, roles, workspace
 
@@ -16,7 +17,9 @@ READ_ROLES = (*NOTICE_ROLES, "agency")
 REPORT_ROLES = ("community", "resident", "family", "caregiver")
 RESPOND_ROLES = ("community", "caregiver", "street", "civil")
 
-DEVICE_LABELS = {"VITALS": "体征监测", "SOS": "一键呼叫"}
+DEVICE_LABELS = {"VITALS": "通用体征监测", "BP_MONITOR": "血压计", "ECG_PATCH": "心电贴",
+                 "FALL_RADAR": "跌倒雷达", "SOS": "一键呼叫"}
+REPORT_LABELS = {"HEALTH": "健康异常", "HOME_RISK": "居家环境隐患"}
 ALERT_LABELS = {"PENDING": "待确认", "FALSE_ALARM": "误报已关闭", "CONFIRMED": "已确认", "TIMEOUT": "超时转应急"}
 EVENT_LABELS = {"OPEN": "待响应", "ESCALATED": "已升级", "RESPONDED": "已响应", "ARRIVED": "已到场", "CLOSED": "已处置"}
 SOURCE_LABELS = {"THRESHOLD": "体征告警", "SOS": "一键呼叫", "MANUAL": "人工上报"}
@@ -63,7 +66,7 @@ def index():
 
     readings = query("""
         SELECT TOP (30) r.ArchiveNo, r.DeviceCode, r.CapturedAt, r.MetricName, r.UnitLabel,
-                        r.MeasuredValue, r.IsAbnormal
+                        r.MeasuredValue, r.IsAbnormal, r.SourceType
         FROM dbo.v_HealthReadingHistory AS r
         JOIN dbo.fn_HealthArchiveScope(?) AS scope ON scope.ArchiveNo = r.ArchiveNo
         ORDER BY r.CapturedAt DESC, r.ReadingId DESC
@@ -76,30 +79,34 @@ def index():
     """, user_id)
     events = query("""
         SELECT TOP (40) EventId, ArchiveNo, FullName, SourceType, Severity, State, ResponseDeadline,
-                        ResponderName, RespondedBy, ArrivedAt, ClosedAt, Resolution
+                        ResponderName, RespondedAt, RespondedBy, ArrivedAt, ClosedAt, Resolution, ReportKind, ReportText
         FROM dbo.v_HealthEventOverview AS e
         WHERE EXISTS (SELECT 1 FROM dbo.fn_HealthArchiveScope(?) AS scope WHERE scope.ArchiveNo = e.ArchiveNo)
            OR e.RespondedBy = ?
         ORDER BY CASE WHEN e.State = 'CLOSED' THEN 1 ELSE 0 END, e.EventId DESC
     """, user_id, user_id)
     notices = query("""
-        SELECT TOP (30) NoticeId, AlertId, EventId, Kind, CreatedAt, ReadAt
-        FROM dbo.HealthNotice WHERE RecipientUserId = ?
-        ORDER BY CASE WHEN ReadAt IS NULL THEN 0 ELSE 1 END, NoticeId DESC
+        SELECT TOP (30) notice.NoticeId, notice.AlertId, notice.EventId, notice.Kind, notice.CreatedAt, notice.ReadAt,
+                        alert.State AS AlertState
+        FROM dbo.HealthNotice notice LEFT JOIN dbo.HealthAlert alert ON alert.AlertId=notice.AlertId
+        WHERE notice.RecipientUserId = ?
+        ORDER BY CASE WHEN notice.ReadAt IS NULL THEN 0 ELSE 1 END, notice.NoticeId DESC
     """, user_id)
 
     panels = [
         {
             "title": "应急事件",
-            "columns": ["编号", "老人", "来源", "等级", "状态", "响应截止", "响应人", "处置结果"],
-            "rows": [(e["EventId"], e["FullName"], SOURCE_LABELS[e["SourceType"]], e["Severity"],
-                      EVENT_LABELS[e["State"]], _display_time(e["ResponseDeadline"]), e["ResponderName"], e["Resolution"])
+            "columns": ["编号", "老人", "来源", "等级", "状态", "响应截止", "响应人", "上报说明", "处置结果"],
+            "rows": [(e["EventId"], e["FullName"], REPORT_LABELS.get(e["ReportKind"], SOURCE_LABELS[e["SourceType"]]),
+                      e["Severity"], EVENT_LABELS[e["State"]], _display_time(e["ResponseDeadline"]),
+                      e["ResponderName"], e["ReportText"], e["Resolution"])
                      for e in events],
         },
         {
-            "title": "模拟通知",
-            "columns": ["通知编号", "类型", "告警", "事件", "时间", "状态"],
-            "rows": [(n["NoticeId"], NOTICE_LABELS[n["Kind"]], n["AlertId"], n["EventId"], _display_time(n["CreatedAt"]),
+            "title": "站内通知",
+            "columns": ["通知编号", "类型", "告警", "复核状态", "事件", "时间", "状态"],
+            "rows": [(n["NoticeId"], NOTICE_LABELS[n["Kind"]], n["AlertId"], ALERT_LABELS.get(n["AlertState"]),
+                       n["EventId"], _display_time(n["CreatedAt"]),
                       "已读" if n["ReadAt"] else "未读") for n in notices],
         },
         {
@@ -110,12 +117,23 @@ def index():
         },
         {
             "title": "近期体征记录",
-            "columns": ["档案", "设备", "采集时间", "指标", "测量值", "是否异常"],
+            "columns": ["档案", "设备", "采集时间", "指标", "测量值", "来源", "是否异常"],
             "rows": [(r["ArchiveNo"], r["DeviceCode"], _display_time(r["CapturedAt"]), r["MetricName"],
-                      f'{r["MeasuredValue"]} {r["UnitLabel"]}', "异常" if r["IsAbnormal"] else "正常")
+                       f'{r["MeasuredValue"]} {r["UnitLabel"]}', "设备" if r["SourceType"] == "DEVICE" else "人工",
+                       "异常" if r["IsAbnormal"] else "正常")
                      for r in readings],
         },
     ]
+    if role in ("street", "civil"):
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        panels.append({
+            "title": "辖区预警响应",
+            "columns": ["事件", "等级", "响应截止", "实际响应", "到场时间", "时限情况"],
+            "rows": [(event["EventId"], event["Severity"], _display_time(event["ResponseDeadline"]),
+                      _display_time(event["RespondedAt"]), _display_time(event["ArrivedAt"]),
+                      ("已超时" if (event["RespondedAt"] or now) >= event["ResponseDeadline"]
+                       else "按时响应" if event["RespondedAt"] else "尚在时限内")) for event in events],
+        })
 
     if role in ("family", "resident") and elder_options:
         panels.insert(0, {
@@ -126,10 +144,11 @@ def index():
     elif role in REPORT_ROLES and elder_options:
         source_options = [("SOS", "一键呼叫")]
         if role in ("community", "caregiver"):
-            source_options.append(("MANUAL", "人工上报异常"))
+            source_options.extend(REPORT_LABELS.items())
         panels.insert(0, {"title": "发起应急事件", "form": [
             field("archive_no", "老人档案", "select", elder_options),
             field("source_type", "来源", "select", source_options),
+            field("report_text", "人工上报说明（呼叫时可留空）", "textarea", required=False),
         ], "hidden": {"request_key": uuid4().hex}, "action": url_for("health.open_event"), "submit": "发起应急事件"})
 
     if role in RESPOND_ROLES:
@@ -180,7 +199,7 @@ def index():
 
 def _device_panels(panels, user_id, role, elder_options):
     bindings = query("""
-        SELECT b.BindingId, b.DeviceCode, b.DeviceType, b.ArchiveNo, b.StartsAt, b.EndsAt, b.IsEnabled,
+        SELECT b.BindingId, b.DeviceCode, b.DeviceType, b.ArchiveNo, b.StartsAt, b.EndsAt, b.IsEnabled, b.InstallationLocation,
                CASE WHEN NOT EXISTS (SELECT 1 FROM dbo.HealthBinding AS newer
                     WHERE newer.DeviceId = b.DeviceId AND newer.StartsAt > b.StartsAt)
                     THEN 1 ELSE 0 END AS IsLatest
@@ -188,9 +207,11 @@ def _device_panels(panels, user_id, role, elder_options):
         JOIN dbo.fn_HealthArchiveScope(?) AS scope ON scope.ArchiveNo = b.ArchiveNo
         ORDER BY b.StartsAt DESC, b.BindingId DESC
     """, user_id)
-    panels.append({"title": "设备绑定历史", "columns": ["设备", "类型", "归属档案", "绑定时间", "解绑时间"],
-                   "rows": [(b["DeviceCode"], DEVICE_LABELS[b["DeviceType"]], b["ArchiveNo"], _display_time(b["StartsAt"]), _display_time(b["EndsAt"])) for b in bindings[:30]]})
-    vitals = dict.fromkeys(b["DeviceCode"] for b in bindings if b["DeviceType"] == "VITALS" and b["IsEnabled"])
+    panels.append({"title": "设备绑定历史", "columns": ["设备", "类型", "安装位置", "归属档案", "绑定时间", "解绑时间", "状态"],
+                   "rows": [(b["DeviceCode"], DEVICE_LABELS[b["DeviceType"]], b["InstallationLocation"] or "未记录",
+                             b["ArchiveNo"], _display_time(b["StartsAt"]), _display_time(b["EndsAt"]),
+                             "启用" if b["IsEnabled"] else "停用") for b in bindings[:30]]})
+    vitals = dict.fromkeys(b["DeviceCode"] for b in bindings if b["DeviceType"] != "SOS" and b["IsEnabled"])
     if vitals:
         metrics = query("SELECT MetricCode, MetricName, UnitLabel FROM dbo.HealthThreshold ORDER BY MetricName")
         panels.append({"title": "模拟体征上报", "form": [
@@ -201,13 +222,14 @@ def _device_panels(panels, user_id, role, elder_options):
 
     if role == "community" and elder_options:
         panels.append({"title": "登记新设备", "form": [field("device_code", "设备编号", maxlength=24),
-            field("device_type", "类型", "select", list(DEVICE_LABELS.items())), field("archive_no", "老人档案", "select", elder_options)],
+            field("device_type", "类型", "select", [(code, name) for code, name in DEVICE_LABELS.items() if code != "VITALS"]),
+            field("archive_no", "老人档案", "select", elder_options), field("location", "安装位置", maxlength=120)],
             "action": url_for("health.register_device"), "submit": "登记并绑定"})
         fresh = [b for b in bindings if b["IsLatest"] and b["EndsAt"] and b["IsEnabled"]]
         active = [b for b in bindings if b["EndsAt"] is None]
         if fresh:
             panels.append({"title": "重新绑定设备", "form": [field("device_code", "设备", "select", [(b["DeviceCode"], b["DeviceCode"]) for b in fresh]),
-                              field("archive_no", "老人档案", "select", elder_options)],
+                              field("archive_no", "老人档案", "select", elder_options), field("location", "安装位置", maxlength=120)],
                            "action": url_for("health.bind_device"), "submit": "绑定"})
         if active:
             panels.append({"title": "解除设备绑定", "form": [field("device_code", "设备", "select", [(b["DeviceCode"], b["DeviceCode"]) for b in active])],
@@ -221,15 +243,19 @@ def register_device():
     if not code or len(code) > 24:
         flash("设备编号须为 1 到 24 个字符。", "error")
         return redirect(url_for("health.index"))
-    return _perform("设备已登记并绑定。", "EXEC dbo.usp_RegisterHealthDevice ?, ?, ?, ?", code,
-                    request.form.get("device_type"), request.form.get("archive_no"), g.user["id"])
+    device_type = request.form.get("device_type")
+    if device_type not in DEVICE_LABELS or device_type == "VITALS":
+        raise ValueError("请选择设备类型。")
+    return _perform("设备已登记并绑定。", "EXEC dbo.usp_RegisterHealthDevice ?, ?, ?, ?, @InstallationLocation=?", code,
+                    device_type, request.form.get("archive_no"), g.user["id"], bounded(request.form.get("location", ""), 120))
 
 
 @bp.post("/devices/bind")
 @roles("community")
 def bind_device():
-    return _perform("设备已绑定。", "EXEC dbo.usp_BindHealthDevice ?, ?, ?",
-                    request.form.get("device_code"), request.form.get("archive_no"), g.user["id"])
+    return _perform("设备已绑定。", "EXEC dbo.usp_BindHealthDevice ?, ?, ?, @InstallationLocation=?",
+                    request.form.get("device_code"), request.form.get("archive_no"), g.user["id"],
+                    bounded(request.form.get("location", ""), 120))
 
 
 @bp.post("/devices/unbind")
@@ -265,8 +291,17 @@ def review_alert():
 @bp.post("/events/open")
 @roles(*REPORT_ROLES)
 def open_event():
-    return _perform("应急事件已记录，模拟通知可在收件箱查看。", "EXEC dbo.usp_OpenHealthEvent ?, ?, ?, ?",
-                    request.form.get("archive_no"), request.form.get("request_key"), request.form.get("source_type"), g.user["id"])
+    source = request.form.get("source_type")
+    report_kind, report_text = None, None
+    if source in REPORT_LABELS and g.user["role"] in ("community", "caregiver"):
+        report_kind, source = source, "MANUAL"
+        report_text = bounded(request.form.get("report_text", ""), 400)
+    elif source != "SOS":
+        raise ValueError("请选择有效的上报类别。")
+    return _perform("应急事件已记录，通知可在站内查看。",
+                    "EXEC dbo.usp_OpenHealthEvent ?, ?, ?, ?, @ReportKind=?, @ReportText=?",
+                    request.form.get("archive_no"), request.form.get("request_key"), source, g.user["id"],
+                    report_kind, report_text)
 
 
 @bp.post("/events/update")

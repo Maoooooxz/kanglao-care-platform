@@ -1,9 +1,11 @@
 import re
+from datetime import timedelta
 from secrets import token_hex
 
 import pytest
 
-from kanglao.db import execute, one, query
+from kanglao.db import execute, one, query, transaction
+from kanglao.web import beijing_today
 from conftest import log_in, submit
 
 EXPECTED_ROUTES = {
@@ -76,3 +78,87 @@ def test_every_demo_business_table_has_twenty_rows(application):
             name = row["name"]
             assert re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name)
             assert one(f"SELECT COUNT(*) AS n FROM dbo.[{name}]")["n"] >= 20, name
+
+
+def _panel(response, title):
+    assert response.status_code == 200
+    return next(section for section in re.findall(r"<section\b[^>]*>.*?</section>", response.get_data(as_text=True), re.S)
+                if re.search(rf"<h2\b[^>]*>{re.escape(title)}</h2>", section))
+
+
+def test_reassessment_reminders_include_day_fourteen_and_only_local_archives(application, password):
+    client = application.test_client()
+    log_in(client, "community", password)
+    today = beijing_today()
+    with application.app_context(), transaction() as db:
+        try:
+            for archive_no in ("E0001", "E0005"):
+                execute("EXEC dbo.usp_RecordAbilityAssessment ?,?,'ADL',75,N'轻度失能',N'边界测试',?,?",
+                        f"QA-REMIND-{archive_no}", archive_no, today, today + timedelta(days=14))
+            panel = _panel(client.get("/"), "待复评")
+            assert "/archives/E0001" in panel and "/archives/E0005" not in panel
+            assert (today + timedelta(days=14)).isoformat() in panel
+            execute("UPDATE dbo.AbilityAssessment SET ValidThrough=? WHERE AssessmentNo='QA-REMIND-E0001'",
+                    today + timedelta(days=15))
+            assert "/archives/E0001" not in _panel(client.get("/"), "待复评")
+            execute("UPDATE dbo.ElderArchive SET IsActive=0 WHERE ArchiveNo='E0001'")
+            execute("UPDATE dbo.AbilityAssessment SET ValidThrough=? WHERE AssessmentNo='QA-REMIND-E0001'", today)
+            assert "/archives/E0001" not in _panel(client.get("/"), "待复评")
+        finally:
+            db.rollback()
+
+
+def test_order_pagination_keeps_old_orders_actionable(application, password):
+    client = application.test_client()
+    log_in(client, "community", password)
+    insert = """
+        INSERT dbo.ServiceOrder (
+            OrderNo, ArchiveNo, PlanId, ServiceTypeId, CommunityId, Status, Price, AppointmentStart,
+            AppointmentEnd, Address, Latitude, Longitude, Channel, DispatchDeadline
+        )
+        SELECT TOP ({limit}) CONCAT('QA-PAGE-',LEFT(CONVERT(varchar(36),NEWID()),18)),
+            source.ArchiveNo,source.PlanId,source.ServiceTypeId,source.CommunityId,?,source.Price,
+            source.AppointmentStart,source.AppointmentEnd,source.Address,source.Latitude,source.Longitude,
+            source.Channel,source.DispatchDeadline
+        FROM dbo.ServiceOrder source CROSS JOIN sys.all_objects
+        WHERE source.OrderNo='DEMO-ORDER-001-3';
+    """
+    with application.app_context(), transaction() as db:
+        try:
+            item = one(insert.format(limit=1) + "SELECT CONVERT(int,SCOPE_IDENTITY()) AS OrderId;", "RESCHEDULE")
+            order_id = item["OrderId"]
+            execute(insert.format(limit=160), "NEW")
+            order_link = f'href="/services/orders/{order_id}"'
+            assert order_link not in _panel(client.get("/services/orders"), "服务订单")
+            assert order_link in _panel(client.get("/services/orders?page=6"), "服务订单")
+            path = "/services/orders?status=RESCHEDULE"
+            page = client.get(path)
+            assert order_link in _panel(page, "服务订单")
+            assert f'value="{order_id}"' in _panel(page, "取消预约")
+            response = submit(client, path, operation="CANCEL", order_id=order_id, reason="分页测试取消")
+            assert response.status_code == 302 and response.location == path
+            assert one("SELECT Status FROM dbo.ServiceOrder WHERE OrderId=?", order_id)["Status"] == "CANCELLED"
+        finally:
+            db.rollback()
+
+
+def test_monthly_inspection_panel_respects_role_scope(application, password):
+    agency, caregiver, supervisor = (application.test_client() for _ in range(3))
+    for client, username in ((agency, "agency"), (caregiver, "caregiver"), (supervisor, "civil")):
+        log_in(client, username, password)
+    path = "/subsidy/quality"
+    title = "护工月度抽查考核"
+    for client in (agency, caregiver):
+        panel = _panel(client.get(path), title)
+        assert "演示护工001" in panel and "演示护工002" not in panel
+    assert "机构月度抽查考核" not in caregiver.get(path).get_data(as_text=True)
+    assert "演示服务机构001" in _panel(agency.get(path), "机构月度抽查考核")
+    with application.app_context(), transaction() as db:
+        try:
+            execute("""UPDATE inspection SET ReviewDistrict=N'测试外辖区'
+                    FROM dbo.ServiceInspection inspection JOIN dbo.Worker worker ON worker.WorkerId=inspection.WorkerId
+                    WHERE worker.WorkerNo='DEMO-WORKER-002'""")
+            panel = _panel(supervisor.get(path), title)
+            assert "演示护工001" in panel and "演示护工002" not in panel
+        finally:
+            db.rollback()

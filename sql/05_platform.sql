@@ -22,6 +22,11 @@ IF COL_LENGTH(N'dbo.ElderArchive', N'GuardianName') IS NULL
         Longitude decimal(9,6) NOT NULL CONSTRAINT DF_ElderArchive_Lon DEFAULT (116.341000),
         Tags nvarchar(200) NULL;
 
+IF COL_LENGTH(N'dbo.ElderArchive', N'SubsidyCategory') IS NULL
+    ALTER TABLE dbo.ElderArchive ADD SubsidyCategory varchar(12) NOT NULL
+        CONSTRAINT DF_ElderArchive_SubsidyCategory DEFAULT 'GENERAL'
+        CONSTRAINT CK_ElderArchive_SubsidyCategory CHECK (SubsidyCategory IN ('GENERAL','LOW_INCOME'));
+
 IF OBJECT_ID(N'dbo.AppUser', N'U') IS NULL
     CREATE TABLE dbo.AppUser (
         UserId int IDENTITY PRIMARY KEY,
@@ -84,7 +89,8 @@ BEGIN
        OR old.Latitude <> current_row.Latitude OR old.Longitude <> current_row.Longitude
        OR ISNULL(old.GuardianName,N'') <> ISNULL(current_row.GuardianName,N'')
        OR ISNULL(old.GuardianContactEncrypted,0x) <> ISNULL(current_row.GuardianContactEncrypted,0x)
-       OR ISNULL(old.Tags,N'') <> ISNULL(current_row.Tags,N'');
+       OR ISNULL(old.Tags,N'') <> ISNULL(current_row.Tags,N'')
+       OR old.SubsidyCategory <> current_row.SubsidyCategory;
 END;
 GO
 

@@ -59,15 +59,17 @@ INSERT dbo.WorkerCommunity(WorkerId, CommunityId)
 SELECT w.WorkerId, d.CommunityId FROM @Demo d JOIN dbo.Worker w ON w.WorkerNo = CONCAT('DEMO-WORKER-', d.Suffix)
 WHERE NOT EXISTS (SELECT 1 FROM dbo.WorkerCommunity n WHERE n.WorkerId = w.WorkerId AND n.CommunityId = d.CommunityId);
 
-INSERT dbo.ServiceType(Code, Name, Unit, Rate, StandardMinutes, Subsidizable)
+INSERT dbo.ServiceType(Code, Name, Unit, Rate, StandardMinutes, Subsidizable, CategoryCode)
 SELECT CONCAT('DEMO-SERVICE-', d.Suffix), CONCAT(categories.Label, N'（演示', d.Suffix, N'）'),
-       IIF(d.Seq % 2 = 0, N'次', N'小时'), 40 + d.Seq, 60, 1
-FROM @Demo d JOIN (VALUES (0,N'助餐'),(1,N'助浴'),(2,N'陪诊'),(3,N'家政'),(4,N'康复护理')) categories(Kind, Label)
+       IIF(d.Seq % 2 = 0, N'次', N'小时'), 40 + d.Seq, 60, 1, categories.CategoryCode
+FROM @Demo d JOIN (VALUES (0,N'助餐','MEAL'),(1,N'助浴','BATH'),(2,N'陪诊','ESCORT'),
+    (3,N'家政','HOUSEWORK'),(4,N'康复护理','REHAB')) categories(Kind, Label, CategoryCode)
 ON categories.Kind = (d.Seq - 1) % 5
 WHERE NOT EXISTS (SELECT 1 FROM dbo.ServiceType t WHERE t.Code = CONCAT('DEMO-SERVICE-', d.Suffix));
 
-INSERT dbo.WorkerService(WorkerId, ServiceTypeId, CredentialNo, ValidFrom, ValidThrough)
-SELECT w.WorkerId, t.ServiceTypeId, CONCAT(N'模拟证书-', d.Suffix), DATEADD(year, -1, @Today), DATEADD(year, 1, @Today)
+INSERT dbo.WorkerService(WorkerId, ServiceTypeId, CredentialNo, ValidFrom, ValidThrough, CredentialType, CredentialLevel)
+SELECT w.WorkerId, t.ServiceTypeId, CONCAT(N'模拟证书-', d.Suffix), DATEADD(year, -1, @Today), DATEADD(year, 1, @Today),
+       N'养老护理', N'演示初级'
 FROM @Demo d JOIN dbo.Worker w ON w.WorkerNo = CONCAT('DEMO-WORKER-', d.Suffix)
 JOIN dbo.ServiceType t ON t.Code = CONCAT('DEMO-SERVICE-', d.Suffix)
 WHERE NOT EXISTS (SELECT 1 FROM dbo.WorkerService s WHERE s.WorkerId = w.WorkerId AND s.ServiceTypeId = t.ServiceTypeId);
@@ -136,7 +138,8 @@ WHERE d.IsHistorical = 1 AND NOT EXISTS (SELECT 1 FROM dbo.ServiceDispatch x WHE
 
 INSERT dbo.ServiceVisit(OrderId, DispatchId, WorkerId, CheckInAt, CheckOutAt, InLatitude, InLongitude,
        OutLatitude, OutLongitude, InFence, OutFence, InShift, OutShift, ServiceRecord, WorkStatus,
-       EffectiveMinutes, ReviewReason, ConfirmedAt, ConfirmedBy, ConfirmationText, ConfirmationHash, FeedbackScore, Feedback)
+       EffectiveMinutes, ReviewReason, ConfirmedAt, ConfirmedBy, ConfirmationText, ConfirmationHash, FeedbackScore, Feedback,
+       SubsidyCategory, SubsidyAbilityLevel)
 SELECT o.OrderId, x.DispatchId, x.WorkerId, d.StartsAt, d.EndsAt, d.Latitude, d.Longitude, d.Latitude,
        d.Longitude, 1, IIF(example.NeedsReview=1,0,1), 1, 1, N'模拟完成上门服务',
        IIF(example.NeedsReview=1,'REVIEW','VALID'), IIF(example.NeedsReview=1,NULL,60),
@@ -145,8 +148,12 @@ SELECT o.OrderId, x.DispatchId, x.WorkerId, d.StartsAt, d.EndsAt, d.Latitude, d.
        IIF(example.IsSigned=1,N'模拟家属电子签字',NULL),
        IIF(example.IsSigned=1,dbo.fn_ServiceConfirmationHash(
            o.OrderId,1,DATEADD(minute,5,d.EndsAt),N'模拟家属电子签字'),NULL),
-       IIF(example.IsSigned=1,5,NULL), IIF(example.IsSigned=1,N'模拟评价',NULL)
+        IIF(example.IsSigned=1,5,NULL), IIF(example.IsSigned=1,N'模拟评价',NULL),
+        elder.SubsidyCategory, package.AbilityLevel
 FROM @Scheduled d JOIN dbo.ServiceOrder o ON o.OrderNo = d.OrderNo
+JOIN dbo.ElderArchive elder ON elder.ArchiveNo = o.ArchiveNo
+JOIN dbo.CarePlan planRow ON planRow.PlanId = o.PlanId
+JOIN dbo.CarePackage package ON package.PackageId = planRow.PackageId
 JOIN dbo.ServiceDispatch x ON x.OrderId = o.OrderId AND x.CloseReason = N'服务完成'
 CROSS APPLY (VALUES (
     IIF(d.OrderNo IN ('DEMO-ORDER-006-2','DEMO-ORDER-007-2'),1,0),

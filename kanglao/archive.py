@@ -12,6 +12,8 @@ from .web import beijing_today, field, roles, workspace
 
 bp = Blueprint("archive", __name__, url_prefix="/archives")
 READERS = ("community", "family", "resident", "street", "civil")
+SUBSIDY_CATEGORIES = {"GENERAL": "普通", "LOW_INCOME": "低保"}
+ABILITY_LEVELS = ("能力完好", "轻度失能", "中度失能", "重度失能", "完全失能")
 
 
 def archive_scope():
@@ -28,7 +30,7 @@ def current_archive(number, *, lock=False):
     table = "dbo.ElderArchive e WITH (UPDLOCK,HOLDLOCK)" if lock else "dbo.ElderArchive e"
     row = one(
         "SELECT e.ArchiveNo,e.FullName,e.BirthDate,e.Address,e.GuardianName,e.GuardianContactEncrypted,"
-        " e.Tags,e.IsActive,e.Latitude,e.Longitude,e.CommunityId,c.Name AS CommunityName"
+        " e.Tags,e.SubsidyCategory,e.IsActive,e.Latitude,e.Longitude,e.CommunityId,c.Name AS CommunityName"
         f" FROM {table} JOIN dbo.Community c ON c.CommunityId=e.CommunityId"
         f" WHERE e.ArchiveNo=? AND {scope}", number, *params,
     )
@@ -54,17 +56,21 @@ def coordinate(value, limit):
         raise ValueError("坐标不合法") from error
 
 
-def archive_values(values):
+def archive_values(values, *, default_category="GENERAL"):
     dob = date.fromisoformat(values.get("birth_date", ""))
     if dob > beijing_today():
         raise ValueError("出生日期晚于当天")
     phone = bounded(values.get("guardian_contact", ""), 64, optional=True)
     encrypted = current_app.extensions["contacts"].encrypt(phone.encode()) if phone else None
+    category = values.get("subsidy_category", default_category)
+    if category not in SUBSIDY_CATEGORIES:
+        raise ValueError("请选择有效的补贴对象类别")
     return (
         bounded(values.get("name", ""), 100), dob,
         bounded(values.get("address", ""), 200),
         bounded(values.get("guardian", ""), 100, optional=True) or None, encrypted,
         bounded(values.get("tags", ""), 200, optional=True) or None,
+        category,
         coordinate(values.get("latitude", "40.008"), 90),
         coordinate(values.get("longitude", "116.341"), 180),
     )
@@ -79,9 +85,9 @@ def new_archive(values):
 
 
 INSERT_ARCHIVE = """INSERT dbo.ElderArchive
-    (IdNumber,ArchiveNo,FullName,BirthDate,Address,GuardianName,GuardianContactEncrypted,Tags,
+    (IdNumber,ArchiveNo,FullName,BirthDate,Address,GuardianName,GuardianContactEncrypted,Tags,SubsidyCategory,
      Latitude,Longitude,CommunityId)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?)"""
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"""
 
 
 def archive_form(data=None):
@@ -94,6 +100,8 @@ def archive_form(data=None):
         field("guardian_contact", "监护人联系方式", "tel", value=data.get("contact"),
               required=False, maxlength=64),
         field("tags", "照护标签", value=data.get("Tags"), required=False, maxlength=200),
+        field("subsidy_category", "补贴对象类别", "select", SUBSIDY_CATEGORIES.items(),
+              value=data.get("SubsidyCategory", "GENERAL")),
         field("latitude", "模拟纬度", "number", value=data.get("Latitude", "40.008"),
               step="0.000001", min="-90", max="90"),
         field("longitude", "模拟经度", "number", value=data.get("Longitude", "116.341"),
@@ -170,8 +178,8 @@ def detail(archive_no):
             existing = current_archive(archive_no, lock=True)
             if op == "edit":
                 execute("""UPDATE dbo.ElderArchive SET FullName=?,BirthDate=?,Address=?,GuardianName=?,
-                        GuardianContactEncrypted=?,Tags=?,Latitude=?,Longitude=? WHERE ArchiveNo=?""",
-                        *archive_values(request.form), archive_no)
+                        GuardianContactEncrypted=?,Tags=?,SubsidyCategory=?,Latitude=?,Longitude=? WHERE ArchiveNo=?""",
+                        *archive_values(request.form, default_category=existing["SubsidyCategory"]), archive_no)
             elif op == "transfer":
                 target = int(request.form["community"])
                 execute("EXEC dbo.usp_TransferElderArchive ?,?,?", archive_no,
@@ -201,8 +209,9 @@ def detail(archive_no):
     )
     masked = one("SELECT MaskedIdNumber FROM dbo.v_ElderArchiveSummary WHERE ArchiveNo=?", archive_no)
     panels = [
-        dict(title="档案概要", columns=["编号", "姓名", "社区", "证件号", "出生日期"],
-             rows=[(archive_no, data["FullName"], data["CommunityName"], masked["MaskedIdNumber"], data["BirthDate"])]),
+        dict(title="档案概要", columns=["编号", "姓名", "社区", "证件号", "出生日期", "补贴对象类别"],
+             rows=[(archive_no, data["FullName"], data["CommunityName"], masked["MaskedIdNumber"], data["BirthDate"],
+                    SUBSIDY_CATEGORIES[data["SubsidyCategory"]])]),
         dict(title="能力评估历史", columns=["评估编号", "量表", "得分", "等级", "评估员", "评估日", "有效截止"],
              rows=[tuple(row.values()) for row in history]),
     ]
@@ -217,8 +226,7 @@ def detail(archive_no):
             dict(title="登记能力评估", form=[
                 field("scale", "量表", "select", [("ADL", "ADL 日常生活能力"), ("MMSE", "MMSE 简易智能状态")]),
                 field("score", "评估得分", "number", min=0, max=9999, step="0.01"),
-                field("level", "能力等级", "select", [(x, x) for x in (
-                    "能力完好", "轻度失能", "中度失能", "重度失能", "完全失能")]),
+                field("level", "能力等级", "select", [(level, level) for level in ABILITY_LEVELS]),
                 field("assessment_date", "评估日期", "date", value=today),
                 field("valid_through", "有效期截止", "date", value=today + timedelta(days=90)),
             ], hidden={"op": "assessment"}, submit="保存评估"),

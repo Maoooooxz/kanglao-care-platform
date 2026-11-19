@@ -39,7 +39,7 @@ def test_desktop_and_mobile_browser(website, password, tmp_path, monkeypatch):
             desktop.locator("main h1").wait_for()
             desktop.screenshot(path=tmp_path / "community-desktop.png")
             nav = desktop.get_by_role("navigation", name="工作台导航")
-            for label in ("档案", "照护计划", "订单", "人员与排班", "健康与应急", "补贴与抽查"):
+            for label in ("档案", "照护计划", "订单", "人员与排班", "健康与应急", "补贴与抽查", "抽查公示"):
                 with desktop.expect_navigation() as result:
                     nav.get_by_role("link", name=label, exact=True).click()
                 assert result.value.ok, label

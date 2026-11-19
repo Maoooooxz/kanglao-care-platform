@@ -143,6 +143,10 @@ erDiagram
     SubsidyPolicy ||--o{ SubsidyClaimOrder : 核算依据
     SubsidyClaim ||--o{ SubsidyClaimLog : 状态与金额快照
     ServiceOrder o|--o{ ServiceInspection : 可被抽查
+    ServiceOrder ||--o{ InspectionBatchOrder : 被抽样
+    InspectionBatch ||--|{ InspectionBatchOrder : 固定样本
+    InspectionBatch ||--o| InspectionPublication : 公示快照
+    Agency ||--o{ AgencyAssessmentSubmission : 提交考核材料
     Worker ||--o{ ServiceInspection : 受检查
     WorkerRestriction o|--o{ ServiceInspection : 对应限制
     ServiceInspection ||--o{ ServiceInspectionLog : 整改留痕
@@ -163,6 +167,7 @@ classDiagram
       string IdNumber
       string ArchiveNo
       int CommunityId
+      string SubsidyCategory
     }
     class AbilityAssessment {
       int AssessmentId
@@ -189,6 +194,8 @@ classDiagram
       int DispatchId
       int EffectiveMinutes
       datetime ConfirmedAt
+      string SubsidyCategory
+      string SubsidyAbilityLevel
     }
     class HealthBinding {
       int BindingId
@@ -208,6 +215,8 @@ classDiagram
       int ClaimId
       int OrderId
       decimal Amount
+      string SubsidyCategory
+      string SubsidyAbilityLevel
     }
     Community "1" --> "0..*" ElderArchive
     Community "0..1" --> "0..*" AppUser
@@ -263,7 +272,7 @@ classDiagram
 | ServiceVisit | OrderId 或 DispatchId → WorkerId、签到签退、工时核算、签字与反馈 |
 | HealthBinding、HealthReading | BindingId → DeviceId、ArchiveNo、起止时间，ReadingId → BindingId、指标和采集结果 |
 | HealthAlert、HealthEvent | AlertId 和唯一 ReadingId 确定待确认记录，EventId 确定事件生命周期，适用时按 AlertId 唯一 |
-| SubsidyPolicy | PolicyId 或 District、ServiceTypeId、ValidFrom 的组合确定费率和截止日 |
+| SubsidyPolicy | PolicyId 或 District、ServiceTypeId、BeneficiaryCategory、AbilityLevel、ValidFrom 的组合确定费率和截止日 |
 | SubsidyClaim | ClaimId 或 ArchiveNo、ServiceTypeId、PeriodMonth 的组合确定本期申报状态及金额 |
 | SubsidyClaimOrder | ClaimId、OrderId 为联合主键，OrderId 还受唯一约束。核算行记录结算时依据和价格快照 |
 
@@ -289,7 +298,7 @@ classDiagram
 | 账户 | 授权范围与职责 |
 | --- | --- |
 | 社区管理员 | 按 CommunityId 处理本社区档案、照护、服务和申报 |
-| 老人、家属 | 按 ArchiveNo 查看关联档案与业务，签字动作由家属账号执行 |
+| 老人、家属 | 按 ArchiveNo 查看关联档案与业务，老人本人或关联家属之一可签字 |
 | 护工 | 按 WorkerId 处理本人派单、服务、应急与质量记录 |
 | 机构负责人 | 按 AgencyId 管理所属护工、班次、异常工时和整改 |
 | 街道审核员、民政监管员 | 按 District 查询辖区，分开推进初审、复审和拨付 |
@@ -299,3 +308,12 @@ Flask 路由校验账号和业务范围，DAO 使用参数化 SQL。写入表单
 服务过程使用事务和范围锁保护排班、有效照护计划及派单状态。设备绑定保留时间区间，通过绑定标识关联采集的历史归属。应急事件与报警的唯一约束防止同一报警重复创建事件。补贴过程校验同一老人、项目、社区和月份，唯一申报和明细约束保证归集一致性。触发器记录档案、照护、派单、工时、应急、审核和整改的历史。
 
 复核恢复、超时派单归池和应急升级由应用的 SQL 业务过程处理，周期作业与手动运行入口复用同一逻辑。数据库备份与隔离恢复演练见技术验收记录。
+
+## 核算与考核口径
+
+- 签退晚于预约结束时间即转入工时复核。签字与工时审核分开：订单可先完成确认，但工时未获通过不能核算补贴。
+- 补贴先核对辖区、服务项目和北京时间的服务完成日，再按签到时的对象类别、能力等级匹配，具体对象优先、具体等级其次。金额取有效工时乘费率、订单金额、单笔上限三者中的最小值。候选列表和申报共用 `v_SubsidyApplicableOrder`，已申报的费用和审核快照不随复评更新。
+- `v_MonthlyInspectionResults` 按北京时间的抽查月份、辖区和护工归集。机构平均分按实际抽查次数加权；整改结案率以需要整改的抽查为分母，复查通过计入原抽查月。监管侧按辖区过滤后再汇总。
+- 确认前，服务对象可按档案查看服务记录；自付只从已核定或已拨付的申报明细计算。每次提交在申报日志保存不可由业务操作覆盖的证明版本，包含记录、有效工时、签字摘要、核算依据等。
+- 抽查批次采用已结束的北京时间服务月份和辖区内实际签退的完成订单。事务内按比例向上取整后固化样本；首条同辖区检查计入批次，民政可在完成全部样本后发布不含个人明细的汇总快照。机构考核分别以实际检查、投诉、工时所属自然月为准，监管意见独立留存。
+- 设备安装位置属于绑定历史。模拟读数只为启用且绑定合成档案的演示设备生成，读数编号按设备和 UTC 分钟幂等；异常在入库事务内生成三方站内通知。响应和超时升级沿用现有应急规则。
