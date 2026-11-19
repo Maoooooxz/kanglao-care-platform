@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }} · 康老</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body class="{{ 'signed-in' if g.user else 'signed-out' }}">
+  <a href="#main" class="skip-link">跳到主要内容</a>
+  {% if g.user %}
+    <aside class="sidebar">
+      <a class="brand" href="{{ url_for('home.index') }}">
+        <span class="brand-mark" aria-hidden="true">康</span>
+        <span><strong>康老</strong><small>社区居家养老</small></span>
+      </a>
+      <nav aria-label="工作台导航">
+        <a href="/" {% if request.path == '/' %}aria-current="page"{% endif %}><span class="nav-mark" aria-hidden="true">台</span>工作台</a>
+        {% for label, href, icon, description in navigation %}
+          <a href="{{ href }}" {% if request.path.startswith(href) %}aria-current="page"{% endif %}>
+            <span class="nav-mark" aria-hidden="true">{{ icon }}</span>{{ label }}
+          </a>
+        {% endfor %}
+      </nav>
+      <div class="account">
+        <div class="account-avatar" aria-hidden="true">{{ g.user.display_name[:1] }}</div>
+        <div><strong>{{ g.user.display_name }}</strong><small>{{ role_names[g.user.role] }}</small></div>
+        <form method="post" action="{{ url_for('account.logout') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button type="submit" class="signout">退出</button>
+        </form>
+      </div>
+    </aside>
+  {% endif %}
+  <main id="main" tabindex="-1" class="shell">
+    {% for category, message in get_flashed_messages(with_categories=true) %}
+      <div role="{{ 'alert' if category == 'error' else 'status' }}" class="flash {{ category }}">{{ message }}</div>
+    {% endfor %}
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block content %}
+<header class="page-head">
+  <h1>{{ title }}</h1>
+  {% if subtitle %}<p>{{ subtitle }}</p>{% endif %}
+</header>
+{% if stats %}
+  <div class="stat-grid">
+    {% for stat in stats %}
+    <div class="stat"><span>{{ stat.label if stat is mapping else stat[0] }}</span><strong>{{ stat.value if stat is mapping else stat[1] }}</strong></div>
+    {% endfor %}
+  </div>
+{% endif %}
+<div class="panels">
+  {% for panel in panels %}
+    {% set panel_id = 'panel-' ~ loop.index %}
+    <section class="panel" aria-labelledby="{{ panel_id }}">
+      <header><h2 id="{{ panel_id }}">{{ panel.title }}</h2>
+      {% if panel.text %}<p>{{ panel.text }}</p>{% endif %}</header>
+      {% if panel.search %}
+        <form method="get" class="search"><label class="sr-only" for="{{ panel_id }}-search">搜索</label>
+          <input id="{{ panel_id }}-search" name="q" value="{{ panel.search.value }}" placeholder="{{ panel.search.placeholder }}">
+          <button class="secondary" type="submit">搜索</button>
+        </form>
+      {% endif %}
+      {% if panel.columns %}
+        <div class="table-scroll" tabindex="0" role="region" aria-label="{{ panel.title }}表格">
+          <table><thead><tr>{% for col in panel.columns %}<th scope="col">{{ col }}</th>{% endfor %}</tr></thead>
+          <tbody>
+            {% for row in panel.rows %}
+              {% set row_number = loop.index0 %}
+              <tr>{% for cell in row %}
+                <td>
+                  {% if loop.first and panel.row_links and panel.row_links[row_number] %}
+                    <a href="{{ panel.row_links[row_number] }}">{{ cell }}</a>
+                  {% elif cell is none %}<span class="muted">—</span>
+                  {% else %}
+                    {% set status = status_class(cell) %}
+                    {% if status %}<span class="status {{ status }}">{{ status_label(cell) }}</span>{% else %}{{ cell_display(cell) }}{% endif %}
+                  {% endif %}
+                </td>
+              {% endfor %}</tr>
+            {% else %}
+              <tr><td class="empty" colspan="{{ panel.columns|length }}">暂无记录</td></tr>
+            {% endfor %}
+          </tbody></table>
+        </div>
+      {% endif %}
+      {% if panel.links %}
+        <div class="panel-links">{% for label, href in panel.links %}<a href="{{ href }}">{{ label }}</a>{% endfor %}</div>
+      {% endif %}
+      {% if panel.form is defined %}
+        <form class="form-grid" method="post" action="{{ panel.action or request.path }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          {% for name, value in (panel.hidden or {}).items() %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endfor %}
+          {% for f in panel.form %}
+          <label {% if f.type == 'textarea' or f.type == 'multiselect' %}class="wide"{% endif %}>
+            {{ f.label }}
+            {% if f.type == 'select' or f.type == 'multiselect' %}
+              <select name="{{ f.name }}" {% if f.required %}required{% endif %} {% if f.type == 'multiselect' %}multiple size="4"{% endif %}>
+                {% if f.type == 'select' %}<option value="">请选择</option>{% endif %}
+                {% for option in f.options %}
+                  {% if option is string %}{% set value, title = option, option %}
+                  {% else %}{% set value, title = option %}{% endif %}
+                  <option value="{{ value }}" {% if (f.type == 'multiselect' and f.value and value in f.value) or (f.type == 'select' and (f.value|string) == (value|string)) %}selected{% endif %}>{{ title }}</option>
+                {% endfor %}
+              </select>
+            {% elif f.type == 'textarea' %}
+              <textarea name="{{ f.name }}" rows="4" {% if f.required %}required{% endif %}>{{ f.value if f.value is not none else '' }}</textarea>
+            {% else %}
+              <input name="{{ f.name }}" type="{{ f.type }}" value="{{ f.value if f.value is not none else '' }}"
+                {% if f.required %}required{% endif %}
+                {% for key, value in f.attributes.items() if key in ('min','max','minlength','maxlength','step','placeholder','autocomplete','pattern') %}{{ key }}="{{ value }}" {% endfor %}>
+            {% endif %}
+          </label>
+          {% endfor %}
+          <div class="wide"><button type="submit">{{ panel.submit or '保存' }}</button></div>
+        </form>
+      {% endif %}
+    </section>
+  {% endfor %}
+</div>
+{% endblock %}
