@@ -10,19 +10,21 @@ from secrets import token_urlsafe
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 from waitress import serve
-from werkzeug.security import generate_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 
-from . import LOCAL_CONNECTION, ROOT, create_app
+from . import APP_NAME, LOCAL_CONNECTION, ROOT, create_app
 from .db import execute, one, query, transaction
 
 MIGRATIONS = (
     "01_init.sql", "03_add_ability_assessment.sql", "05_platform.sql",
-    "06_services.sql", "07_health.sql", "08_subsidy.sql", "10_course_completion.sql",
+    "06_services.sql", "07_health.sql", "08_subsidy.sql", "10_course_completion.sql", "11_community_workflows.sql",
 )
 DEMO_BEFORE_USERS = ("05_demo_platform.sql", "06_demo_services.sql")
-DEMO_AFTER_USERS = ("07_demo_health.sql", "08_demo_subsidy.sql", "10_demo_course_completion.sql")
+DEMO_AFTER_USERS = ("07_demo_health.sql", "08_demo_subsidy.sql", "10_demo_course_completion.sql",
+                    "11_demo_beijing_workflows.sql", "12_demo_more_archives.sql")
 CHECKS = ("02_verify.sql", "04_verify_assessment.sql", "06_verify_services.sql",
           "07_verify_health.sql", "08_verify_subsidy.sql", "10_verify_course_completion.sql")
+DEMO_COMMUNITY_PASSWORD = "123456"
 
 
 def configure():
@@ -37,7 +39,7 @@ def configure():
     except FileExistsError:
         print("已存在 .env，本机配置继续使用现有值。")
     else:
-        print("已生成本机 .env。演示账号密码保存在 KANG_LAO_DEMO_PASSWORD。")
+        print("已生成本机 .env。其他演示账号密码保存在 KANG_LAO_DEMO_PASSWORD。")
 
 
 def database_name(value):
@@ -70,43 +72,61 @@ def seed_users():
     password = os.getenv("KANG_LAO_DEMO_PASSWORD")
     if not password:
         raise RuntimeError("演示配置需要 KANG_LAO_DEMO_PASSWORD。")
-    elder = one("SELECT e.CommunityId,c.District FROM dbo.ElderArchive e "
-                "JOIN dbo.Community c ON c.CommunityId=e.CommunityId WHERE e.ArchiveNo='E0001'")
-    worker = one("SELECT WorkerId, AgencyId FROM dbo.Worker WHERE WorkerNo='DEMO-WORKER-001'")
+    elder = one("SELECT FullName,GuardianName FROM dbo.ElderArchive WHERE ArchiveNo='E0001' AND LEFT(IdNumber,6)='000000'")
+    community_demo = one("SELECT CommunityId,District FROM dbo.Community WHERE CommunityId=1 AND District=N'海淀演示区'")
+    worker = one("SELECT WorkerId,AgencyId,Name FROM dbo.Worker WHERE WorkerNo='DEMO-WORKER-001'")
+    if elder is None or worker is None or community_demo is None:
+        raise RuntimeError("找不到用于初始化演示账号的合成档案或护工。")
     users = [
-        ("community", "社区管理员", "community", elder["CommunityId"], None, None, None, None),
-        ("family", "示例家属", "family", None, "E0001", None, None, None),
-        ("resident", "示例老人", "resident", None, "E0001", None, None, None),
-        ("caregiver", "示例护工", "caregiver", None, None, worker["WorkerId"], None, None),
-        ("agency", "机构负责人", "agency", None, None, None, worker["AgencyId"], None),
-        ("street", "街道审核员", "street", None, None, None, None, elder["District"]),
-        ("civil", "民政监管员", "civil", None, None, None, None, elder["District"]),
+        ("community", "蔡元涵", "社区管理员", "community", community_demo["CommunityId"], None, None, None, None),
+        ("family", elder["GuardianName"] or "周敏", "示例家属", "family", None, "E0001", None, None, None),
+        ("resident", elder["FullName"], "示例老人", "resident", None, "E0001", None, None, None),
+        ("caregiver", worker["Name"], "示例护工", "caregiver", None, None, worker["WorkerId"], None, None),
+        ("agency", "林佳音", "机构负责人", "agency", None, None, None, worker["AgencyId"], None),
+        ("street", "陈明远", "街道审核员", "street", None, None, None, None, community_demo["District"]),
+        ("civil", "贺晓岚", "民政监管员", "civil", None, None, None, None, community_demo["District"]),
     ]
-    for row in query("SELECT CommunityId FROM dbo.Community WHERE CommunityId BETWEEN 1 AND 20"):
+    for row in query("SELECT CommunityId,Name FROM dbo.Community WHERE CommunityId BETWEEN 1 AND 20"):
         number = row["CommunityId"]
-        users.append((f"community{number:02d}", f"演示社区管理员 {number}", "community",
+        users.append((f"community{number:02d}", f'{row["Name"]}服务台', f"演示社区管理员 {number}", "community",
                       number, None, None, None, None))
     for row in query(
-        "SELECT ArchiveNo FROM dbo.ElderArchive WHERE ArchiveNo BETWEEN 'E0001' AND 'E0020' "
+        "SELECT ArchiveNo,FullName,GuardianName FROM dbo.ElderArchive WHERE ArchiveNo BETWEEN 'E0001' AND 'E0020' "
         "AND LEFT(IdNumber, 6)='000000'"
     ):
         archive = row["ArchiveNo"]
-        users.append((f"family{archive[1:]}", f"演示家属 {archive}", "family",
+        users.append((f"family{archive[1:]}", row["GuardianName"] or f'{row["FullName"]}的家属',
+                      f"演示家属 {archive}", "family",
                       None, archive, None, None, None))
-    for row in query("SELECT WorkerId,AgencyId,WorkerNo FROM dbo.Worker WHERE WorkerNo LIKE 'DEMO-WORKER-%'"):
+    for row in query("""SELECT w.WorkerId,w.AgencyId,w.WorkerNo,w.Name,a.Name AS AgencyName
+                      FROM dbo.Worker w JOIN dbo.Agency a ON a.AgencyId=w.AgencyId
+                      WHERE w.WorkerNo LIKE 'DEMO-WORKER-[0-9][0-9][0-9]'"""):
         suffix = row["WorkerNo"][-3:]
-        users.append((f"caregiver{suffix}", f"演示护工 {suffix}", "caregiver",
+        users.append((f"caregiver{suffix}", row["Name"], f"演示护工 {suffix}", "caregiver",
                       None, None, row["WorkerId"], None, None))
-        users.append((f"agency{suffix}", f"演示机构 {suffix}", "agency",
+        users.append((f"agency{suffix}", f'{row["AgencyName"]}值班室', f"演示机构 {suffix}", "agency",
                       None, None, None, row["AgencyId"], None))
     with transaction():
-        for username, name, role, community, archive, worker, agency, district in users:
-            if one("SELECT UserId FROM dbo.AppUser WITH (UPDLOCK,HOLDLOCK) WHERE Username=?", username):
+        for username, name, old_name, role, community, archive, worker_id, agency, district in users:
+            existing = one("""SELECT UserId,DisplayName,PasswordHash,Role,CommunityId,ArchiveNo,WorkerId,AgencyId,District
+                            FROM dbo.AppUser WITH (UPDLOCK,HOLDLOCK) WHERE Username=?""", username)
+            if existing:
+                scoped_fields = ("Role", "CommunityId", "ArchiveNo", "WorkerId", "AgencyId", "District")
+                if tuple(existing[key] for key in scoped_fields) != (role, community, archive, worker_id, agency, district):
+                    if username == "community":
+                        raise RuntimeError("现有 community 账号不属于合成社区，未重置其密码。")
+                    continue
+                if existing["DisplayName"] != name and (username == "community" or existing["DisplayName"] == old_name):
+                    execute("UPDATE dbo.AppUser SET DisplayName=? WHERE UserId=?", name, existing["UserId"])
+                if username == "community" and not check_password_hash(existing["PasswordHash"], DEMO_COMMUNITY_PASSWORD):
+                    execute("UPDATE dbo.AppUser SET PasswordHash=?,FailedAttempts=0,LockedUntil=NULL WHERE UserId=?",
+                            generate_password_hash(DEMO_COMMUNITY_PASSWORD), existing["UserId"])
                 continue
+            account_password = DEMO_COMMUNITY_PASSWORD if username == "community" else password
             execute(
                 "INSERT dbo.AppUser(Username,DisplayName,PasswordHash,Role,CommunityId,ArchiveNo,WorkerId,AgencyId,District) "
-                "VALUES (?,?,?,?,?,?,?,?,?)", username, name, generate_password_hash(password),
-                role, community, archive, worker, agency, district,
+                "VALUES (?,?,?,?,?,?,?,?,?)", username, name, generate_password_hash(account_password),
+                role, community, archive, worker_id, agency, district,
             )
         execute("""
             UPDATE visit SET ConfirmedBy=signer.UserId, ConfirmationHash=dbo.fn_ServiceConfirmationHash(
@@ -120,7 +140,7 @@ def seed_users():
             WHERE orders.OrderNo LIKE 'DEMO-ORDER-%' AND visit.ConfirmationText=N'模拟家属电子签字'
               AND visit.ConfirmedBy<>signer.UserId
         """)
-    print("演示账号已准备。使用 .env 中的演示密码登录。")
+    print("演示账号已准备：community 使用指定的本机演示密码；其他账号沿用 .env 设置。")
 
 
 def process_jobs(app, watch, simulate_devices=False):
@@ -148,7 +168,7 @@ def process_jobs(app, watch, simulate_devices=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="康老系统 SQL Server 工具")
+    parser = argparse.ArgumentParser(description=f"{APP_NAME} SQL Server 工具")
     parser.add_argument("--database", type=database_name, default="KanglaoCourse")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("configure", help="生成本机演示账号和加密配置")
@@ -182,7 +202,7 @@ def main():
     elif args.command == "jobs":
         process_jobs(app, args.watch, args.simulate_devices)
     else:
-        print(f"康老工作台 http://127.0.0.1:{args.port}", flush=True)
+        print(f"{APP_NAME} http://127.0.0.1:{args.port}", flush=True)
         serve(app, host="127.0.0.1", port=args.port)
 
 

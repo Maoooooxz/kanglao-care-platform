@@ -20,6 +20,7 @@ ORDER_STATUSES = ("NEW", "POOL", "OFFERED", "ACCEPTED", "IN_SERVICE", "AWAITING_
                   "COMPLETED", "REVIEW", "RESCHEDULE", "CANCELLED")
 ORDER_PAGE_SIZE = 30
 SERVICE_CATEGORIES = {"MEAL": "助餐", "BATH": "助浴", "ESCORT": "陪诊", "HOUSEWORK": "家政", "REHAB": "康复护理"}
+EMPLOYMENT_STATUSES = {"ON_DUTY": "在岗", "ON_LEAVE": "请假", "LEFT": "离职"}
 ORDER_ACTIONS = {
     "community": {"DISPATCH", "CANCEL", "REVIEW_APPROVE", "RESCHEDULE", "WORK_APPROVE", "WORK_REJECT", "COMPLAINT_RESOLVE"},
     "family": {"CONFIRM", "FEEDBACK", "CANCEL", "RESCHEDULE", "COMPLAIN"},
@@ -101,10 +102,11 @@ def _archive_options():
         f"SELECT ArchiveNo,FullName FROM dbo.ElderArchive WHERE IsActive=1 AND {column}=? ORDER BY ArchiveNo", value)]
 
 
-def _worker_options():
+def _worker_options(*, active_only=True):
     scope, args = _worker_scope("w")
+    active = "AND w.EmploymentStatus='ON_DUTY'" if active_only else ""
     workers = query("SELECT w.WorkerId,w.WorkerNo,w.Name FROM dbo.Worker w JOIN dbo.Agency a ON a.AgencyId=w.AgencyId "
-                    f"WHERE w.IsActive=1 AND {scope} ORDER BY w.WorkerNo", *args)
+                    f"WHERE {scope} {active} ORDER BY w.WorkerNo", *args)
     return [(row["WorkerId"], f'{row["WorkerNo"]} · {row["Name"]}') for row in workers]
 
 
@@ -212,15 +214,10 @@ def _book_order():
             g.user["community_id"] if role == "community" else None)
 
 
-def _change_order(scope, args, action, *, order_id=None):
+def _change_order(order, action):
     role = g.user["role"]
     if action not in ORDER_ACTIONS.get(role, set()):
         abort(403)
-    if order_id is None:
-        order_id = int(request.form["order_id"])
-    order = one(f"SELECT o.OrderId,o.WorkerId FROM dbo.v_ServiceOrderOverview o WHERE o.OrderId=? AND {scope}", order_id, *args)
-    if order is None:
-        abort(404)
     worker_id = g.user["worker_id"] if role == "caregiver" else None
     if action == "DISPATCH":
         worker_id = int(request.form["worker_id"])
@@ -234,36 +231,25 @@ def _change_order(scope, args, action, *, order_id=None):
     latitude, longitude = _coordinates() if action in {"CHECK_IN", "CHECK_OUT"} else (None, None)
     execute("EXEC dbo.usp_ServiceOrderAction @OrderId=?,@Action=?,@WorkerId=?,@Reason=?,@ActorId=?,"
             "@Latitude=?,@Longitude=?,@NewStart=?,@NewEnd=?,@FeedbackScore=?",
-            order_id, action, worker_id, reason, g.user["id"], latitude, longitude, start, end, score)
+             order["OrderId"], action, worker_id, reason, g.user["id"], latitude, longitude, start, end, score)
 
 
-def _booking_panel(action):
+def _booking_panel(services):
     fields = [field("archive_no", "老人档案", "select", _archive_options()),
-              field("service_type_id", "服务项目", "select", [(row["ServiceTypeId"], row["Name"]) for row in
-                    query("SELECT ServiceTypeId,Name FROM dbo.ServiceType ORDER BY Name")]), *_slots(),
+              field("service_type_id", "服务项目", "select", [(row["ServiceTypeId"], row["Name"]) for row in services]), *_slots(),
               field("address", "服务地址（自填地址须附两项坐标，留空取档案地址）", required=False, maxlength=200),
               *_location_fields()]
     if g.user["role"] == "community":
         fields.append(field("channel", "下单渠道", "select", [("COMMUNITY", "社区代下单"), ("PHONE", "电话下单")]))
-    return _form("预约上门服务", fields, action, hidden={"operation": "BOOK"}, submit="提交预约")
+    return _form("预约上门服务", fields, url_for("services.book"), submit="提交预约")
 
 
-def _order_forms(rows, action):
+def _order_forms(order, action):
     panels = []
     role = g.user["role"]
-    if role in BOOKERS:
-        panels.append(_booking_panel(action))
-    if role == "community":
-        candidates = query("""SELECT TOP (100) o.OrderId,o.ArchiveNo,o.ServiceName,e.WorkerName,e.Remaining
-            FROM dbo.v_ServiceOrderOverview o CROSS APPLY dbo.fn_EligibleServiceShifts(o.OrderId) e
-            WHERE o.CommunityId=? AND o.Status IN ('NEW','POOL','OFFERED','ACCEPTED')
-                AND o.AppointmentStart>SYSUTCDATETIME() ORDER BY o.AppointmentStart,e.WorkerId""", g.user["community_id"])
-        panels.append(dict(title="可接单护工推荐", columns=["订单", "老人档案", "项目", "候选护工", "剩余班次名额"],
-                           rows=[tuple(row[key] for key in ("OrderId", "ArchiveNo", "ServiceName", "WorkerName", "Remaining"))
-                                 for row in candidates]))
 
     definitions = (
-        ("DISPATCH", "派单或改派", ("NEW", "POOL", "OFFERED", "ACCEPTED")),
+        ("DISPATCH", "派单", ("NEW", "POOL", "OFFERED", "ACCEPTED")),
         ("ACCEPT", "接受派单", ("OFFERED",)), ("CHECK_IN", "模拟上门签到", ("ACCEPTED",)),
         ("CHECK_OUT", "模拟离场签退", ("IN_SERVICE",)),
         ("CONFIRM", "服务签字确认", ("AWAITING_CONFIRMATION",)), ("FEEDBACK", "服务评价", ("COMPLETED",)),
@@ -277,18 +263,36 @@ def _order_forms(rows, action):
     for operation, title, states in definitions:
         if operation not in ORDER_ACTIONS.get(role, set()):
             continue
-        available = [row for row in rows if row["Status"] in states or (not states and row["WorkStatus"] == "REVIEW")]
-        if operation == "COMPLAIN":
-            available = [row for row in available if row["ComplainedAt"] is None]
-        elif operation == "COMPLAINT_RESOLVE":
-            available = [row for row in available if row["ComplainedAt"] and row["ComplaintResolvedAt"] is None]
-        if not available:
+        if (states and order["Status"] not in states) or (not states and order["WorkStatus"] != "REVIEW"):
             continue
-        fields = [field("order_id", "订单", "select", [(row["OrderId"], f'{row["OrderId"]} · {row["ServiceName"]} · {row["ArchiveNo"]}')
-                    for row in available])]
+        if operation in {"ACCEPT", "CHECK_IN"} and order["WorkerEmploymentStatus"] != "ON_DUTY":
+            panels.append(dict(title=title, text="护工当前不在岗，请联系社区改派。"))
+            continue
+        if operation == "CONFIRM" and not order["ServiceRecord"]:
+            continue
+        if operation == "COMPLAIN" and order["ComplainedAt"] is not None:
+            continue
+        if operation == "COMPLAINT_RESOLVE" and (not order["ComplainedAt"] or order["ComplaintResolvedAt"]):
+            continue
+        fields = []
         if operation == "DISPATCH":
-            fields.extend([field("worker_id", "护工", "select", _worker_options()),
-                           field("reason", "改派原因（首次可留空）", required=False, maxlength=250)])
+            reassigning = order["DispatchId"] is not None and order["ClosedAt"] is None
+            if reassigning:
+                title = "改派护工"
+            candidates = query("""SELECT eligible.WorkerId,eligible.WorkerName,MAX(eligible.Remaining) AS Remaining
+                FROM dbo.fn_EligibleServiceShifts(?) eligible
+                WHERE EXISTS (SELECT 1 FROM dbo.ServiceOrder WHERE OrderId=? AND AppointmentStart>SYSUTCDATETIME())
+                GROUP BY eligible.WorkerId,eligible.WorkerName ORDER BY eligible.WorkerId""", order["OrderId"], order["OrderId"])
+            if reassigning:
+                candidates = [row for row in candidates if row["WorkerId"] != order["WorkerId"]]
+            if not candidates:
+                panels.append(dict(title=title, text="当前没有符合社区、资质和班次要求的护工。"))
+                continue
+            fields.extend([field("worker_id", "可接单护工", "select", [
+                (row["WorkerId"], f'{row["WorkerName"]}（剩余 {row["Remaining"]} 个名额）') for row in candidates
+            ])])
+            if reassigning:
+                fields.append(field("reason", "改派原因", maxlength=250))
         elif operation in {"CHECK_IN", "CHECK_OUT"}:
             fields.extend(_location_fields())
             if operation == "CHECK_OUT":
@@ -308,7 +312,7 @@ def _order_forms(rows, action):
     return panels
 
 
-@bp.route("/orders", methods=["GET", "POST"])
+@bp.get("/orders")
 @roles(*ALL_ROLES)
 def orders():
     role = g.user["role"]
@@ -316,58 +320,47 @@ def orders():
     status = request.args.get("status", "")
     status = status if status in ORDER_STATUSES else ""
     page = max(1, min(100_000, request.args.get("page", 1, type=int)))
-    list_url = url_for("services.orders", status=status or None, page=page if page > 1 else None)
-    if request.method == "POST":
-        operation = request.form.get("operation")
-        if operation == "BOOK":
-            if role not in BOOKERS:
-                abort(403)
-            _book_order()
-        else:
-            _change_order(scope, args, operation)
-        flash("订单操作已保存。", "success")
-        return redirect(list_url)
-
     filters = f"({scope}) AND o.Status=?" if status else scope
     params = (*args, status) if status else args
     rows = query(
-        f"SELECT o.* FROM dbo.v_ServiceOrderOverview o WHERE {filters} "
+        "SELECT o.OrderId,o.ArchiveNo,o.ServiceName,o.AppointmentStart,o.Status,o.WorkerName "
+        f"FROM dbo.v_ServiceOrderOverview o WHERE {filters} "
         "ORDER BY o.OrderId DESC OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
         *params, (page - 1) * ORDER_PAGE_SIZE, ORDER_PAGE_SIZE + 1,
     )
-    links = [("服务项目目录", url_for("services.catalog"))]
-    links.extend((label, url_for("services.orders", status=status or None, page=target))
+    actions = [("派单记录", url_for("services.dispatches"))]
+    if role in BOOKERS:
+        actions.insert(0, ("新建预约", url_for("services.book")))
+    links = [(label, url_for("services.orders", status=status or None, page=target))
              for label, target, show in (
                  ("上一页", page - 1, page > 1), ("下一页", page + 1, len(rows) > ORDER_PAGE_SIZE),
-             ) if show)
+             ) if show]
     rows = rows[:ORDER_PAGE_SIZE]
-    display_address = role in {"community", "family", "resident", "caregiver", "agency"}
-    columns = ["订单", "档案", "服务项目", "开始", "结束", "金额", "状态", "护工",
-               "工时状态", "有效分钟", "签字时间", "评分", "说明"]
-    if display_address:
-        columns.append("服务地址")
-    table = []
-    for row in rows:
-        cells = (row["OrderId"], row["ArchiveNo"], row["ServiceName"], _time(row["AppointmentStart"]),
-                 _time(row["AppointmentEnd"]), row["Price"], _status(row["Status"]), row["WorkerName"],
-                 _status(row["WorkStatus"]), row["EffectiveMinutes"], _time(row["ConfirmedAt"]),
-                 row["FeedbackScore"], row["ReviewReason"])
-        table.append(cells + (row["Address"],) if display_address else cells)
-    panels = [dict(title="服务订单", text=f"第 {page} 页", columns=columns, rows=table, links=links,
-                   row_links=[url_for("services.order_detail", order_id=row["OrderId"]) for row in rows],
+    table = [(row["OrderId"], row["ArchiveNo"], row["ServiceName"], row["AppointmentStart"],
+              _status(row["Status"]), row["WorkerName"]) for row in rows]
+    panels = [dict(title="服务订单", text=f"第 {page} 页", columns=["订单", "档案", "服务项目", "预约开始", "状态", "护工"],
+                   rows=table, actions=actions, links=links,
+                   row_links=[url_for("services.order_detail", order_id=row["OrderId"], status=status or None,
+                                      page=page if page > 1 else None) for row in rows],
                    status_filter=dict(value=status, options=[(state, STATUS[state]) for state in ORDER_STATUSES]))]
-    complaints = [row for row in rows if row["ComplainedAt"] is not None]
-    if complaints:
-        panels.append(dict(title="服务投诉与处理", columns=["订单", "投诉时间", "投诉", "处理时间", "处理结果"],
-                           rows=[(row["OrderId"], _time(row["ComplainedAt"]), row["ComplaintText"],
-                                  _time(row["ComplaintResolvedAt"]), row["ComplaintResolution"] or "待社区处理")
-                                 for row in complaints]))
+    return workspace("订单", "选择订单编号查看详情及可用操作。", panels)
+
+
+def _dispatch_panel(rows):
+    return dict(title="派单历史", columns=["派单", "订单", "护工", "发出", "接受", "结束", "原因"],
+                rows=[(row["DispatchId"], row["OrderId"], row["WorkerName"], row["OfferedAt"],
+                       row["AcceptedAt"], row["ClosedAt"], row["CloseReason"]) for row in rows])
+
+
+@bp.get("/orders/dispatches")
+@roles(*ALL_ROLES)
+def dispatches():
+    role = g.user["role"]
     history_scope, history_args = _scope("h")
     history = query(f"SELECT TOP (80) h.* FROM dbo.v_ServiceDispatchHistory h WHERE {history_scope} "
                     "ORDER BY h.DispatchId DESC", *history_args)
-    panels.append(dict(title="派单历史", columns=["派单", "订单", "护工", "发出", "接受", "结束", "原因"],
-                       rows=[(row["DispatchId"], row["OrderId"], row["WorkerName"], _time(row["OfferedAt"]),
-                              _time(row["AcceptedAt"]), _time(row["ClosedAt"]), row["CloseReason"]) for row in history]))
+    panels = [_dispatch_panel(history)]
+    panels[0]["links"] = [("返回订单列表", url_for("services.orders"))]
     if role in {"community", "agency"}:
         timeouts = query(f"""SELECT h.* FROM dbo.v_ServiceDispatchHistory h
             JOIN dbo.ServiceDispatch dispatch ON dispatch.DispatchId=h.DispatchId
@@ -382,8 +375,7 @@ def orders():
         if role == "agency" and pending:
             panels.append(_form("登记超时跟进", [field("dispatch_id", "超时派单", "select", pending),
                                 field("note", "跟进说明", maxlength=250)], url_for("services.dispatch_followup")))
-    panels.extend(_order_forms(rows, list_url))
-    return workspace("服务下单与派单", "评估、照护计划、服务地址和护工可用性均通过校验后，才可进入下一步。", panels)
+    return workspace("派单记录", "", panels)
 
 
 @bp.post("/orders/dispatch-followup")
@@ -392,7 +384,7 @@ def dispatch_followup():
     execute("EXEC dbo.usp_FollowUpDispatchTimeout ?,?,?", g.user["id"], int(request.form["dispatch_id"]),
             _text("note", 250))
     flash("跟进说明已保存，社区可查看。", "success")
-    return redirect(url_for("services.orders"))
+    return redirect(url_for("services.dispatches"))
 
 
 @bp.route("/orders/<int:order_id>", methods=["GET", "POST"])
@@ -403,19 +395,31 @@ def order_detail(order_id):
     order = one(f"SELECT o.* FROM dbo.v_ServiceOrderOverview o WHERE o.OrderId=? AND {scope}", order_id, *args)
     if order is None:
         abort(404)
-    action = url_for("services.order_detail", order_id=order_id)
+    status = request.args.get("status")
+    page = max(1, min(100_000, request.args.get("page", 1, type=int)))
+    list_params = dict(status=status if status in ORDER_STATUSES else None, page=page if page > 1 else None)
+    action = url_for("services.order_detail", order_id=order_id, **list_params)
     if request.method == "POST":
-        if request.form.get("operation") != "CONFIRM":
-            abort(400)
-        _change_order(scope, args, "CONFIRM", order_id=order_id)
-        flash("服务签字已保存。", "success")
+        _change_order(order, request.form.get("operation"))
+        flash("订单操作已保存。", "success")
         return redirect(action)
 
+    summary = [("档案", order["ArchiveNo"]), ("服务项目", order["ServiceName"]), ("护工", order["WorkerName"]),
+               ("预约开始", order["AppointmentStart"]), ("预约结束", order["AppointmentEnd"]),
+               ("实际签到", order["CheckInAt"]), ("实际签退", order["CheckOutAt"]), ("签字时间", order["ConfirmedAt"]),
+               ("订单状态", _status(order["Status"])), ("工时状态", _status(order["WorkStatus"])),
+               ("有效分钟", order["EffectiveMinutes"]), ("订单处理说明", order["ReviewReason"]),
+               ("工时复核说明", order["WorkReviewReason"]),
+               ("服务评价", order["FeedbackScore"]), ("评价内容", order["Feedback"])]
+    if role in {"community", "agency", "caregiver"} and order["WorkerEmploymentStatus"]:
+        summary.insert(3, ("护工状态", EMPLOYMENT_STATUSES[order["WorkerEmploymentStatus"]]))
+    if role in {"community", "family", "resident", "caregiver", "agency"}:
+        summary.append(("服务地址", order["Address"]))
+    if role in {"caregiver", "agency"}:
+        summary.append(("订单金额（元）", order["Price"]))
     panels = [dict(title="服务记录", text=order["ServiceRecord"] or "护工尚未填写服务记录。",
-                   columns=["档案", "服务项目", "护工", "实际签到", "实际签退", "签字时间", "订单状态"],
-                   rows=[(order["ArchiveNo"], order["ServiceName"], order["WorkerName"], order["CheckInAt"],
-                          order["CheckOutAt"], order["ConfirmedAt"], _status(order["Status"]))],
-                   links=[("返回订单列表", url_for("services.orders"))])]
+                   columns=["项目", "内容"], rows=summary,
+                   links=[("返回订单列表", url_for("services.orders", **list_params))])]
     if role in {"resident", "family", "community", "street", "civil"}:
         settlement = one("""SELECT line.OrderPrice,line.Amount,claim.Status FROM dbo.SubsidyClaimOrder line
                 JOIN dbo.SubsidyClaim claim ON claim.ClaimId=line.ClaimId WHERE line.OrderId=?""", order_id)
@@ -427,23 +431,41 @@ def order_detail(order_id):
         else:
             costs = (order["Price"], "待核定", "待核定")
         panels.append(dict(title="补贴与自付", columns=["订单金额（元）", "核定补贴（元）", "自付（元）"], rows=[costs]))
-    if role in {"resident", "family"} and order["Status"] == "AWAITING_CONFIRMATION" and order["ServiceRecord"]:
-        label = "老人本人电子签字" if role == "resident" else "家属电子签字"
-        panels.append(_form("确认服务", [field("reason", label, maxlength=200)], action,
-                            hidden={"operation": "CONFIRM"}, submit="签字确认"))
+    if order["ComplainedAt"]:
+        panels.append(dict(title="服务投诉与处理", columns=["投诉时间", "投诉", "处理时间", "处理结果"],
+                           rows=[(order["ComplainedAt"], order["ComplaintText"], order["ComplaintResolvedAt"],
+                                  order["ComplaintResolution"] or "待社区处理")]))
+    panels.extend(_order_forms(order, action))
+    history_scope, history_args = _scope("h")
+    history = query(f"SELECT h.* FROM dbo.v_ServiceDispatchHistory h WHERE h.OrderId=? AND {history_scope} "
+                    "ORDER BY h.DispatchId DESC", order_id, *history_args)
+    if history:
+        panels.append(_dispatch_panel(history))
     return workspace(f'订单 #{order["OrderId"]}', order["OrderNo"], panels)
+
+
+@bp.route("/orders/book", methods=["GET", "POST"])
+@roles(*BOOKERS)
+def book():
+    if request.method == "POST":
+        _book_order()
+        flash("预约已保存。", "success")
+        return redirect(url_for("services.orders"))
+    services = query("""SELECT ServiceTypeId,Code,Name,CategoryCode,Unit,Rate,StandardMinutes,Subsidizable
+                     FROM dbo.ServiceType ORDER BY Name""")
+    return workspace("新建预约", "", [
+        _booking_panel(services),
+        dict(title="服务项目", columns=["编号", "名称", "类别", "计价单位", "指导价（元）", "标准分钟", "可补贴"],
+             rows=[(row["Code"], row["Name"], SERVICE_CATEGORIES.get(row["CategoryCode"], "未记录"),
+                    row["Unit"], row["Rate"], row["StandardMinutes"], "是" if row["Subsidizable"] else "否")
+                   for row in services], links=[("返回订单列表", url_for("services.orders"))]),
+    ])
 
 
 @bp.get("/catalog")
 @roles(*ALL_ROLES)
 def catalog():
-    services = query("SELECT Code,Name,CategoryCode,Unit,Rate,StandardMinutes,Subsidizable FROM dbo.ServiceType ORDER BY Name")
-    return workspace("服务项目目录", "查看服务类别、价格和补贴资格。", [
-        dict(title="服务项目", columns=["编号", "名称", "类别", "计价单位", "指导价（元）", "标准分钟", "可补贴"],
-             rows=[(row["Code"], row["Name"], SERVICE_CATEGORIES.get(row["CategoryCode"], "未记录"),
-                    row["Unit"], row["Rate"], row["StandardMinutes"], "是" if row["Subsidizable"] else "否")
-                   for row in services]),
-    ])
+    return redirect(url_for("services.book" if g.user["role"] in BOOKERS else "services.orders"))
 
 
 @bp.route("/workers", methods=["GET", "POST"])
@@ -482,13 +504,18 @@ def workers():
                     raise ValueError("培训完成日期不能晚于当天")
                 execute("UPDATE dbo.Worker SET TrainingCompletedOn=? WHERE WorkerId=? AND AgencyId=?",
                         completed_on, worker_id, agency_id)
+            elif operation == "EMPLOYMENT":
+                status = request.form.get("employment_status")
+                if status not in EMPLOYMENT_STATUSES:
+                    raise ValueError("请选择有效的护工状态")
+                execute("EXEC dbo.usp_SetWorkerEmploymentStatus ?,?,?", worker_id, g.user["id"], status)
             else:
                 abort(400)
         flash("护工资料已保存。", "success")
         return redirect(url_for("services.workers"))
 
     # 护工名册与汇总视图都使用相同的所属机构、区域和账号范围。
-    worker_rows = query("SELECT TOP (100) w.WorkerId,w.WorkerNo,w.Name,w.Grade,w.Rating,w.IsActive,"
+    worker_rows = query("SELECT TOP (100) w.WorkerId,w.WorkerNo,w.Name,w.Grade,w.Rating,w.EmploymentStatus,"
                         "w.TrainingCompletedOn,a.Name AS AgencyName,"
                         "COALESCE((SELECT SUM(h.EffectiveMinutes) FROM dbo.v_WorkerMonthlyHours h WHERE h.WorkerId=w.WorkerId),0) AS TotalMinutes "
                         "FROM dbo.Worker w JOIN dbo.Agency a ON a.AgencyId=w.AgencyId "
@@ -505,9 +532,9 @@ def workers():
                         f" WHERE {scope.replace('w.District', 'a.District')} ORDER BY w.WorkerNo,t.Name", *args)
     review_scope, review_args = _scope("r")
     review = query(f"SELECT TOP (100) r.* FROM dbo.v_WorkHourReview r WHERE {review_scope} ORDER BY r.OrderId DESC", *review_args)
-    panels = [dict(title="护工资料", columns=["编号", "姓名", "机构", "等级", "评分", "在岗", "培训完成", "累计有效分钟"], rows=[(
+    panels = [dict(title="护工资料", columns=["编号", "姓名", "机构", "等级", "评分", "在岗状态", "培训完成", "累计有效分钟"], rows=[(
                    row["WorkerNo"], row["Name"], row["AgencyName"], row["Grade"], row["Rating"],
-                    "在岗" if row["IsActive"] else "离岗", row["TrainingCompletedOn"], row["TotalMinutes"]) for row in worker_rows]),
+                    EMPLOYMENT_STATUSES[row["EmploymentStatus"]], row["TrainingCompletedOn"], row["TotalMinutes"]) for row in worker_rows]),
               dict(title="排班与名额", columns=["护工", "开始", "结束", "容量", "已接", "剩余"], rows=[(
                    row["WorkerName"], _time(row["StartsAt"]), _time(row["EndsAt"]), row["Capacity"],
                    row["AcceptedCount"], row["Remaining"]) for row in shifts]),
@@ -519,13 +546,17 @@ def workers():
                    for row in credentials]),
               dict(title="待复核工时", columns=["订单", "档案", "护工", "签到", "签退", "原因"], rows=[(
                    row["OrderId"], row["ArchiveNo"], row["WorkerName"], _time(row["CheckInAt"]),
-                   _time(row["CheckOutAt"]), row["ReviewReason"]) for row in review])]
+                   _time(row["CheckOutAt"]), row["ReviewReason"]) for row in review],
+                   row_links=[url_for("services.order_detail", order_id=row["OrderId"]) for row in review])]
     if g.user["role"] == "agency":
         action = url_for("services.workers")
         options = _worker_options()
         communities = query("SELECT c.CommunityId,c.Name FROM dbo.Community c JOIN dbo.Agency a ON a.District=c.District "
                             "WHERE a.AgencyId=? ORDER BY c.Name", g.user["agency_id"])
-        panels.extend([_form("登记护工", [field("name", "姓名", maxlength=100), field("grade", "等级", maxlength=40),
+        panels.extend([_form("调整护工状态", [field("worker_id", "护工", "select", _worker_options(active_only=False)),
+                               field("employment_status", "在岗状态", "select", EMPLOYMENT_STATUSES.items())],
+                              action, hidden={"operation": "EMPLOYMENT"}),
+                       _form("登记护工", [field("name", "姓名", maxlength=100), field("grade", "等级", maxlength=40),
                             field("community_id", "服务社区", "select", [(r["CommunityId"], r["Name"]) for r in communities])],
                             action, hidden={"operation": "ADD_WORKER"}),
                        _form("登记可接单班次", [field("worker_id", "护工", "select", options), *_slots(),

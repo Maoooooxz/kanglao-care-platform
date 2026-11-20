@@ -14,7 +14,8 @@ DECLARE @District nvarchar(80)=N'课设抽查演示区', @CommunityId int=21021,
         @ArchiveNo varchar(20)='DEMO-COURSE-ELDER', @AgencyId int, @WorkerId int,
         @Civil int, @Manager int, @Family int, @ServiceTypeId int, @PackageId int, @AbilityLevel nvarchar(20);
 SELECT @ServiceTypeId=ServiceTypeId FROM dbo.ServiceType WHERE Code='DEMO-SERVICE-001';
-SELECT @PackageId=PackageId,@AbilityLevel=AbilityLevel FROM dbo.CarePackage WHERE Name=N'演示照护包001';
+SELECT @PackageId=package.PackageId,@AbilityLevel=package.AbilityLevel FROM dbo.CarePlan planRow
+JOIN dbo.CarePackage package ON package.PackageId=planRow.PackageId WHERE planRow.PlanNo='DEMO-PLAN-001';
 IF @ServiceTypeId IS NULL OR @PackageId IS NULL THROW 52107, N'请先初始化服务项目和照护包示例。', 1;
 
 BEGIN TRANSACTION;
@@ -23,16 +24,28 @@ IF EXISTS (SELECT 1 FROM dbo.Community WHERE CommunityId=@CommunityId AND Distri
    OR EXISTS (SELECT 1 FROM dbo.ElderArchive WHERE ArchiveNo=@ArchiveNo AND IdNumber<>'000000195001019891')
     THROW 52107, N'课设抽查演示编号与现有数据冲突。', 1;
 IF NOT EXISTS (SELECT 1 FROM dbo.Community WHERE CommunityId=@CommunityId)
-    INSERT dbo.Community(CommunityId,Name,District) VALUES (@CommunityId,N'抽查演示社区',@District);
+    INSERT dbo.Community(CommunityId,Name,District,CityName,AreaName,StreetName)
+    VALUES (@CommunityId,N'冠城园社区',@District,N'北京市',N'海淀区',N'花园路街道');
+UPDATE dbo.Community SET Name=N'冠城园社区',CityName=N'北京市',AreaName=N'海淀区',StreetName=N'花园路街道'
+WHERE CommunityId=@CommunityId AND District=@District AND Name IN (N'抽查演示社区',N'兰溪园社区',N'冠城园社区');
+DECLARE @DemoAddress nvarchar(200)=N'北京市海淀区花园路街道冠城园社区（演示住址）';
 IF NOT EXISTS (SELECT 1 FROM dbo.ElderArchive WHERE ArchiveNo=@ArchiveNo)
     INSERT dbo.ElderArchive(IdNumber,ArchiveNo,FullName,BirthDate,Address,CommunityId)
-    VALUES ('000000195001019891',@ArchiveNo,N'抽查样例老人','19500101',N'抽查演示地址',@CommunityId);
+    VALUES ('000000195001019891',@ArchiveNo,N'孟秋华','19500101',@DemoAddress,@CommunityId);
+UPDATE dbo.ElderArchive SET FullName=N'孟秋华'
+WHERE ArchiveNo=@ArchiveNo AND IdNumber='000000195001019891' AND FullName=N'抽查样例老人';
+UPDATE dbo.ElderArchive SET Address=@DemoAddress
+WHERE ArchiveNo=@ArchiveNo AND IdNumber='000000195001019891' AND CommunityId=@CommunityId
+    AND Address IN (N'抽查演示地址',N'兰溪园 2 号楼 1 单元');
 IF NOT EXISTS (SELECT 1 FROM dbo.Agency WHERE AgencyNo='DEMO-COURSE-AGENCY')
-    INSERT dbo.Agency(AgencyNo,Name,District) VALUES ('DEMO-COURSE-AGENCY',N'抽查示例机构',@District);
+    INSERT dbo.Agency(AgencyNo,Name,District) VALUES ('DEMO-COURSE-AGENCY',N'兰溪园养老服务站',@District);
+UPDATE dbo.Agency SET Name=N'兰溪园养老服务站' WHERE AgencyNo='DEMO-COURSE-AGENCY' AND District=@District AND Name=N'抽查示例机构';
 SELECT @AgencyId=AgencyId FROM dbo.Agency WHERE AgencyNo='DEMO-COURSE-AGENCY' AND District=@District;
 IF @AgencyId IS NULL THROW 52107, N'抽查示例机构不在演示辖区。', 1;
 IF NOT EXISTS (SELECT 1 FROM dbo.Worker WHERE WorkerNo='DEMO-COURSE-WORKER')
-    INSERT dbo.Worker(WorkerNo,AgencyId,Name,Grade) VALUES ('DEMO-COURSE-WORKER',@AgencyId,N'抽查样例护工',N'演示护工');
+    INSERT dbo.Worker(WorkerNo,AgencyId,Name,Grade) VALUES ('DEMO-COURSE-WORKER',@AgencyId,N'郑思雨',N'养老护理员');
+UPDATE dbo.Worker SET Name=N'郑思雨',Grade=IIF(Grade=N'演示护工',N'养老护理员',Grade)
+WHERE WorkerNo='DEMO-COURSE-WORKER' AND AgencyId=@AgencyId AND Name=N'抽查样例护工';
 SELECT @WorkerId=WorkerId FROM dbo.Worker WHERE WorkerNo='DEMO-COURSE-WORKER' AND AgencyId=@AgencyId;
 IF @WorkerId IS NULL THROW 52107, N'抽查样例护工不在演示机构。', 1;
 IF NOT EXISTS (SELECT 1 FROM dbo.WorkerCommunity WHERE WorkerId=@WorkerId AND CommunityId=@CommunityId)
@@ -40,9 +53,9 @@ IF NOT EXISTS (SELECT 1 FROM dbo.WorkerCommunity WHERE WorkerId=@WorkerId AND Co
 
 INSERT dbo.AppUser(Username,DisplayName,PasswordHash,Role,ArchiveNo,AgencyId,District)
 SELECT sample.Username,sample.DisplayName,base.PasswordHash,sample.Role,sample.ArchiveNo,sample.AgencyId,sample.District
-FROM (VALUES ('civil-course-demo',N'抽查演示监管员','civil',NULL,NULL,@District),
-             ('agency-course-demo',N'抽查演示机构负责人','agency',NULL,@AgencyId,NULL),
-             ('family-course-demo',N'抽查演示家属','family',@ArchiveNo,NULL,NULL)
+FROM (VALUES ('civil-course-demo',N'陶明慧','civil',NULL,NULL,@District),
+             ('agency-course-demo',N'许立群','agency',NULL,@AgencyId,NULL),
+             ('family-course-demo',N'孟悦','family',@ArchiveNo,NULL,NULL)
 ) sample(Username,DisplayName,Role,ArchiveNo,AgencyId,District)
 JOIN dbo.AppUser base ON base.Username=sample.Role
 WHERE NOT EXISTS (SELECT 1 FROM dbo.AppUser account WHERE account.Username=sample.Username);
@@ -51,6 +64,9 @@ SELECT @Manager=UserId FROM dbo.AppUser WHERE Username='agency-course-demo' AND 
 SELECT @Family=UserId FROM dbo.AppUser WHERE Username='family-course-demo' AND Role='family' AND Active=1 AND ArchiveNo=@ArchiveNo;
 IF @Civil IS NULL OR @Manager IS NULL OR @Family IS NULL
     THROW 52107, N'请先初始化抽查演示所需账号。', 1;
+UPDATE dbo.AppUser SET DisplayName=N'陶明慧' WHERE UserId=@Civil AND DisplayName=N'抽查演示监管员';
+UPDATE dbo.AppUser SET DisplayName=N'许立群' WHERE UserId=@Manager AND DisplayName=N'抽查演示机构负责人';
+UPDATE dbo.AppUser SET DisplayName=N'孟悦' WHERE UserId=@Family AND DisplayName=N'抽查演示家属';
 
 DECLARE @Months table (PeriodMonth date PRIMARY KEY, PlanNo varchar(30), OrderNo varchar(30),
                        StartsAt datetime2(0), EndsAt datetime2(0));

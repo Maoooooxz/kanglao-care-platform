@@ -14,9 +14,12 @@
 <div class="panels">
   {% for panel in panels %}
     {% set panel_id = 'panel-' ~ loop.index %}
-    <section class="panel" aria-labelledby="{{ panel_id }}">
+    <section class="panel"{% if panel.anchor %} id="{{ panel.anchor }}"{% endif %} aria-labelledby="{{ panel_id }}">
       <header><h2 id="{{ panel_id }}">{{ panel.title }}</h2>
-      {% if panel.text %}<p>{{ panel.text }}</p>{% endif %}</header>
+      {% if panel.text %}<p>{{ panel.text }}</p>{% endif %}
+      {% if panel.actions %}
+        <div class="panel-actions">{% for label, href in panel.actions %}<a href="{{ href }}">{{ label }}</a>{% endfor %}</div>
+      {% endif %}</header>
       {% if panel.search %}
         <form method="get" class="search"><label class="sr-only" for="{{ panel_id }}-search">搜索</label>
           <input id="{{ panel_id }}-search" name="q" value="{{ panel.search.value }}" placeholder="{{ panel.search.placeholder }}">

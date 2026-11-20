@@ -4,6 +4,9 @@ import pytest
 from playwright.sync_api import sync_playwright
 from werkzeug.serving import make_server
 
+from conftest import login_password
+from kanglao import APP_NAME
+
 
 @pytest.fixture(scope="module")
 def website(application):
@@ -18,10 +21,13 @@ def website(application):
         server.server_close()
 
 
-def login(page, website, username, password):
+def login(page, website, username, password, *, screenshot=None):
     page.goto(f"{website}/login")
+    assert page.get_by_role("heading", name=APP_NAME).is_visible()
+    if screenshot:
+        page.screenshot(path=screenshot)
     page.get_by_label("用户名").fill(username)
-    page.get_by_label("密码").fill(password)
+    page.get_by_label("密码").fill(login_password(username, password))
     page.get_by_role("button", name="登录", exact=True).click()
     page.wait_for_url(f"{website}/")
 
@@ -35,15 +41,17 @@ def test_desktop_and_mobile_browser(website, password, tmp_path, monkeypatch):
         browser = playwright.chromium.launch(channel="msedge", headless=True, timeout=15000)
         try:
             desktop = browser.new_page(viewport={"width": 1440, "height": 1000})
-            login(desktop, website, "community", password)
+            login(desktop, website, "community", password, screenshot=tmp_path / "login-desktop.png")
             desktop.locator("main h1").wait_for()
             desktop.screenshot(path=tmp_path / "community-desktop.png")
             nav = desktop.get_by_role("navigation", name="工作台导航")
-            for label in ("档案", "照护计划", "订单", "人员与排班", "健康与应急", "补贴与抽查", "抽查公示"):
+            for label in ("档案", "照护计划", "订单", "人员与排班", "健康与应急", "补贴与抽查"):
                 with desktop.expect_navigation() as result:
                     nav.get_by_role("link", name=label, exact=True).click()
                 assert result.value.ok, label
                 assert desktop.locator("main h1").is_visible()
+            desktop.get_by_role("link", name="抽查结果公示").click()
+            assert desktop.get_by_role("heading", name="抽查结果公示").is_visible()
             desktop.close()
             mobile = browser.new_page(viewport={"width": 390, "height": 844}, is_mobile=True,
                                       has_touch=True, device_scale_factor=2)
@@ -51,6 +59,10 @@ def test_desktop_and_mobile_browser(website, password, tmp_path, monkeypatch):
             response = mobile.goto(f"{website}/health/")
             assert response.ok
             assert mobile.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+            booking = mobile.goto(f"{website}/services/orders/book")
+            assert booking.ok and mobile.get_by_role("columnheader", name="指导价（元）").count() == 1
+            assert mobile.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+            mobile.goto(f"{website}/health/")
             report = mobile.get_by_role("region", name="一键呼叫", exact=True)
             with mobile.expect_navigation() as outcome:
                 report.get_by_role("button", name="立即呼叫").click()

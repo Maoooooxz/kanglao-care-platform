@@ -1,7 +1,7 @@
 import csv
 import io
 import re
-from datetime import date, timedelta
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from secrets import token_hex
 
@@ -14,6 +14,13 @@ bp = Blueprint("archive", __name__, url_prefix="/archives")
 READERS = ("community", "family", "resident", "street", "civil")
 SUBSIDY_CATEGORIES = {"GENERAL": "普通", "LOW_INCOME": "低保"}
 ABILITY_LEVELS = ("能力完好", "轻度失能", "中度失能", "重度失能", "完全失能")
+
+
+def community_title(row):
+    if not row["CityName"]:
+        return row["CommunityName"]
+    district = row["AreaName"] or ""
+    return f"{row['CityName']}{district}{row['StreetName'] or ''} · {row['CommunityName']}"
 
 
 def archive_scope():
@@ -30,7 +37,8 @@ def current_archive(number, *, lock=False):
     table = "dbo.ElderArchive e WITH (UPDLOCK,HOLDLOCK)" if lock else "dbo.ElderArchive e"
     row = one(
         "SELECT e.ArchiveNo,e.FullName,e.BirthDate,e.Address,e.GuardianName,e.GuardianContactEncrypted,"
-        " e.Tags,e.SubsidyCategory,e.IsActive,e.Latitude,e.Longitude,e.CommunityId,c.Name AS CommunityName"
+        " e.Tags,e.SubsidyCategory,e.IsActive,e.CommunityId,"
+        " c.Name AS CommunityName,c.CityName,c.AreaName,c.StreetName"
         f" FROM {table} JOIN dbo.Community c ON c.CommunityId=e.CommunityId"
         f" WHERE e.ArchiveNo=? AND {scope}", number, *params,
     )
@@ -71,8 +79,6 @@ def archive_values(values, *, default_category="GENERAL"):
         bounded(values.get("guardian", ""), 100, optional=True) or None, encrypted,
         bounded(values.get("tags", ""), 200, optional=True) or None,
         category,
-        coordinate(values.get("latitude", "40.008"), 90),
-        coordinate(values.get("longitude", "116.341"), 180),
     )
 
 
@@ -81,13 +87,35 @@ def new_archive(values):
     number = values.get("archive_no", "").strip().upper()
     if not re.fullmatch(r"[0-9]{17}[0-9X]", id_number) or not re.fullmatch(r"[A-Z0-9_-]{1,20}", number):
         raise ValueError("证件号或档案编号格式错误")
-    return id_number, number, *archive_values(values), g.user["community_id"]
+    return id_number, number, *archive_values(values)
 
 
 INSERT_ARCHIVE = """INSERT dbo.ElderArchive
     (IdNumber,ArchiveNo,FullName,BirthDate,Address,GuardianName,GuardianContactEncrypted,Tags,SubsidyCategory,
      Latitude,Longitude,CommunityId)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"""
+
+
+def save_archives(records):
+    identities = sorted(record[0] for record in records)
+    with transaction():
+        if len(identities) != len(set(identities)) or any(
+            one("SELECT 1 AS Present FROM dbo.ElderArchive WITH (UPDLOCK,HOLDLOCK) WHERE IdNumber=?", identity)
+            for identity in identities
+        ):
+            flash("身份证号重复，档案未保存。已在其他社区建档的老人请联系原社区办理迁移。", "error")
+            return False
+        community = g.user["community_id"]
+        location = community_location(community)
+        execute_many(INSERT_ARCHIVE, [(*record, *location, community) for record in records])
+    return True
+
+
+def community_location(community_id):
+    row = one("SELECT Latitude,Longitude FROM dbo.Community WHERE CommunityId=?", community_id)
+    if row is None:
+        abort(400, description="请选择有效的社区。")
+    return row["Latitude"], row["Longitude"]
 
 
 def archive_form(data=None):
@@ -102,10 +130,6 @@ def archive_form(data=None):
         field("tags", "照护标签", value=data.get("Tags"), required=False, maxlength=200),
         field("subsidy_category", "补贴对象类别", "select", SUBSIDY_CATEGORIES.items(),
               value=data.get("SubsidyCategory", "GENERAL")),
-        field("latitude", "模拟纬度", "number", value=data.get("Latitude", "40.008"),
-              step="0.000001", min="-90", max="90"),
-        field("longitude", "模拟经度", "number", value=data.get("Longitude", "116.341"),
-              step="0.000001", min="-180", max="180"),
     ]
 
 
@@ -120,12 +144,11 @@ def index():
             entries = list(csv.reader(io.StringIO(request.form.get("csv_text", "").strip())))
             if not 1 <= len(entries) <= 50 or any(len(row) != len(columns) for row in entries):
                 raise ValueError("批量输入每行需 5 列，单次最多 50 行")
-            with transaction():
-                execute_many(INSERT_ARCHIVE, [new_archive(dict(zip(columns, row))) for row in entries])
-            flash(f"已批量保存 {len(entries)} 份档案。", "success")
+            if save_archives([new_archive(dict(zip(columns, row))) for row in entries]):
+                flash(f"已批量保存 {len(entries)} 份档案。", "success")
         elif request.form.get("op") == "create":
-            execute(INSERT_ARCHIVE, *new_archive(request.form))
-            flash("老人档案已建立。", "success")
+            if save_archives([new_archive(request.form)]):
+                flash("老人档案已建立。", "success")
         else:
             abort(400)
         return redirect(url_for("archive.index"))
@@ -140,13 +163,14 @@ def index():
     count = one(f"SELECT COUNT(*) AS n FROM {tables} WHERE {conditions}", *params)["n"]
     page = min(page, max(1, (count + 11) // 12))
     rows = query(
-        f"SELECT e.ArchiveNo,e.FullName,c.Name,a.AssessmentStatus,e.IsActive FROM {tables} "
+        f"SELECT e.ArchiveNo,e.FullName,c.Name AS CommunityName,c.CityName,c.AreaName,c.StreetName,"
+        f" a.AssessmentStatus,e.IsActive FROM {tables} "
         f"WHERE {conditions} ORDER BY e.ArchiveNo OFFSET ? ROWS FETCH NEXT 12 ROWS ONLY",
         *params, (page - 1) * 12,
     )
     panels = [dict(
         title="老人档案", columns=["档案编号", "姓名", "所属社区", "评估状态", "档案状态"],
-        rows=[(r["ArchiveNo"], r["FullName"], r["Name"], r["AssessmentStatus"],
+        rows=[(r["ArchiveNo"], r["FullName"], community_title(r), r["AssessmentStatus"],
                "在册" if r["IsActive"] else "已停用") for r in rows],
         row_links=[url_for("archive.detail", archive_no=r["ArchiveNo"]) for r in rows],
         search=dict(value=search, placeholder="搜索档案编号或姓名"),
@@ -175,25 +199,30 @@ def detail(archive_no):
             abort(403)
         op = request.form.get("op")
         with transaction():
+            if op in {"transfer", "assessment"}:
+                archive_no = current_archive(archive_no)["ArchiveNo"]
+                execute("EXEC dbo.usp_ServiceLock 'archive',?", archive_no)
             existing = current_archive(archive_no, lock=True)
             if op == "edit":
                 execute("""UPDATE dbo.ElderArchive SET FullName=?,BirthDate=?,Address=?,GuardianName=?,
-                        GuardianContactEncrypted=?,Tags=?,SubsidyCategory=?,Latitude=?,Longitude=? WHERE ArchiveNo=?""",
+                        GuardianContactEncrypted=?,Tags=?,SubsidyCategory=? WHERE ArchiveNo=?""",
                         *archive_values(request.form, default_category=existing["SubsidyCategory"]), archive_no)
             elif op == "transfer":
                 target = int(request.form["community"])
-                execute("EXEC dbo.usp_TransferElderArchive ?,?,?", archive_no,
-                        existing["CommunityId"], target)
+                execute("EXEC dbo.usp_TransferElderArchive ?,?,?,?,?,?,?", archive_no, g.user["id"],
+                        target, bounded(request.form.get("new_address", ""), 200), *community_location(target),
+                        bounded(request.form.get("reason", ""), 250))
             elif op == "toggle":
                 execute("UPDATE dbo.ElderArchive SET IsActive=? WHERE ArchiveNo=?",
                         not existing["IsActive"], archive_no)
             elif op == "assessment":
                 score = coordinate(request.form["score"], 9999)
+                valid_through = request.form.get("valid_through", "").strip()
                 execute("EXEC dbo.usp_RecordAbilityAssessment ?,?,?,?,?,?,?,?",
                         "AS-" + token_hex(8), archive_no, request.form["scale"], score,
                         bounded(request.form["level"], 20), g.user["display_name"],
                         date.fromisoformat(request.form["assessment_date"]),
-                        date.fromisoformat(request.form["valid_through"]))
+                        date.fromisoformat(valid_through) if valid_through else None)
             else:
                 abort(400)
         flash("档案操作已保存。", "success")
@@ -208,10 +237,12 @@ def detail(archive_no):
         archive_no,
     )
     masked = one("SELECT MaskedIdNumber FROM dbo.v_ElderArchiveSummary WHERE ArchiveNo=?", archive_no)
+    can_view_address = g.user["role"] in {"community", "family", "resident"}
     panels = [
         dict(title="档案概要", columns=["编号", "姓名", "社区", "证件号", "出生日期", "补贴对象类别"],
-             rows=[(archive_no, data["FullName"], data["CommunityName"], masked["MaskedIdNumber"], data["BirthDate"],
-                    SUBSIDY_CATEGORIES[data["SubsidyCategory"]])]),
+             rows=[(archive_no, data["FullName"], community_title(data), masked["MaskedIdNumber"], data["BirthDate"],
+                    SUBSIDY_CATEGORIES[data["SubsidyCategory"]])],
+             text=f"居住地址：{data['Address']}" if can_view_address else None),
         dict(title="能力评估历史", columns=["评估编号", "量表", "得分", "等级", "评估员", "评估日", "有效截止"],
              rows=[tuple(row.values()) for row in history]),
     ]
@@ -219,21 +250,35 @@ def detail(archive_no):
         if data["GuardianContactEncrypted"]:
             data["contact"] = current_app.extensions["contacts"].decrypt(
                 bytes(data["GuardianContactEncrypted"])).decode()
-        communities = query("SELECT CommunityId,Name FROM dbo.Community WHERE CommunityId<>? ORDER BY Name",
-                            data["CommunityId"])
+        communities = query(
+            "SELECT CommunityId,Name AS CommunityName,CityName,AreaName,StreetName FROM dbo.Community "
+            "WHERE CommunityId<>? ORDER BY Name", data["CommunityId"],
+        )
+        transfers = query(
+            "SELECT FromCommunityName,ToCommunityName,OccurredAt,"
+            " OperatorName,TransferReason FROM dbo.v_ElderTransferHistory WHERE ArchiveNo=? ORDER BY AuditId DESC",
+            archive_no,
+        )
         today = beijing_today()
         panels.extend([
-            dict(title="登记能力评估", form=[
+            dict(title="登记复评" if history else "登记首次评估", anchor="assessment-form", form=[
                 field("scale", "量表", "select", [("ADL", "ADL 日常生活能力"), ("MMSE", "MMSE 简易智能状态")]),
                 field("score", "评估得分", "number", min=0, max=9999, step="0.01"),
                 field("level", "能力等级", "select", [(level, level) for level in ABILITY_LEVELS]),
                 field("assessment_date", "评估日期", "date", value=today),
-                field("valid_through", "有效期截止", "date", value=today + timedelta(days=90)),
-            ], hidden={"op": "assessment"}, submit="保存评估"),
+                field("valid_through", "有效期截止（可留空）", "date", required=False),
+            ], text="未满 80 岁最长 180 天，满 80 岁最长 90 天。复评会保留历次记录，暂停的计划须经复核后恢复。",
+                 hidden={"op": "assessment"}, submit="保存评估"),
             dict(title="维护档案", form=archive_form(data), hidden={"op": "edit"}, submit="保存修改"),
-            dict(title="跨社区迁移", form=[field("community", "目标社区", "select", [
-                (c["CommunityId"], c["Name"]) for c in communities])],
-                 hidden={"op": "transfer"}, submit="迁移原档案"),
+            dict(title="跨社区迁移", text="迁移会更新原档案，暂停照护计划并取消原社区尚未开始的预约。",
+                 form=[
+                     field("community", "迁入社区", "select", [
+                         (c["CommunityId"], community_title(c)) for c in communities]),
+                     field("new_address", "新居住地址", maxlength=200),
+                     field("reason", "迁移原因", maxlength=250),
+                 ], hidden={"op": "transfer"}, submit="迁移原档案"),
+            dict(title="迁移记录", columns=["原社区", "迁入社区", "迁移时间", "办理人", "原因"],
+                 rows=[tuple(row.values()) for row in transfers]),
             dict(title="档案状态", form=[], hidden={"op": "toggle"},
                  submit="停用档案" if data["IsActive"] else "恢复档案"),
         ])

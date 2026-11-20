@@ -182,7 +182,7 @@ BEGIN
            CASE WHEN new.Status='STREET' THEN (
                SELECT line.OrderId, orders.OrderNo, visit.ServiceRecord, visit.CheckInAt,
                       line.ServiceCompletedAt AS CheckOutAt, line.EffectiveMinutes, line.ConfirmedAt,
-                      visit.ConfirmedBy, signer.Role AS SignerRole,
+                      visit.ConfirmedBy, signer.Role AS SignerRole, signer.DisplayName AS SignerName,
                       CONVERT(varchar(64), visit.ConfirmationHash, 2) AS ConfirmationHash,
                       line.PolicyId, line.SubsidyCategory, line.SubsidyAbilityLevel,
                       line.HourlyRate, line.MaxPerOrder, line.OrderPrice, line.Amount

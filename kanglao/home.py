@@ -1,20 +1,17 @@
-from datetime import timedelta
+from flask import Blueprint, g, url_for
 
-from flask import Blueprint, g, render_template
-
-from .archive import READERS, archive_scope
-from .db import one, query
-from .web import beijing_today, roles
+from .archive import READERS
+from .db import query
+from .web import ROLE_NAMES, roles, workspace
 
 bp = Blueprint("home", __name__)
 WORKSPACES = [
-    ("档案", "/archives/", "档", "老人档案与能力评估", READERS),
-    ("照护计划", "/services/plans", "护", "服务包与照护计划安排", ("community", "family", "resident", "caregiver", "agency", "street", "civil")),
-    ("订单", "/services/orders", "单", "预约、派单与上门服务", ("community", "family", "resident", "caregiver", "agency", "street", "civil")),
-    ("人员与排班", "/services/workers", "班", "护工资质、排班与工时复核", ("community", "caregiver", "agency", "street", "civil")),
-    ("健康与应急", "/health/", "健", "监测设备、异常与应急响应", ("community", "family", "resident", "caregiver", "agency", "street", "civil")),
-    ("补贴与抽查", "/subsidy/", "补", "补贴申报、分级审核和服务监管", ("community", "family", "resident", "caregiver", "agency", "street", "civil")),
-    ("抽查公示", "/oversight/bulletins", "公", "查看已发布的脱敏抽查汇总", ("community", "family", "resident", "caregiver", "agency", "street", "civil")),
+    ("档案", "/archives/", READERS),
+    ("照护计划", "/services/plans", ()),
+    ("订单", "/services/orders", ()),
+    ("人员与排班", "/services/workers", ("community", "caregiver", "agency", "street", "civil")),
+    ("健康与应急", "/health/", ()),
+    ("补贴与抽查", "/subsidy/", ()),
 ]
 
 
@@ -22,44 +19,39 @@ WORKSPACES = [
 def navigation():
     if not g.get("user"):
         return {"navigation": ()}
-    return {"navigation": [item[:4] for item in WORKSPACES if g.user["role"] in item[4]]}
+    return {"navigation": [(label, href) for label, href, allowed in WORKSPACES
+                           if not allowed or g.user["role"] in allowed]}
 
 
 @bp.get("/")
 @roles()
 def index():
-    stats = []
-    recent = []
-    reassessments = None
-    if g.user["role"] in READERS:
-        scope, params = archive_scope()
-        data = one(
-            "SELECT COUNT(*) AS total, COUNT(CASE WHEN a.AssessmentStatus=N'有效' THEN 1 END) AS valid, "
-            "COUNT(CASE WHEN a.AssessmentStatus=N'已过期' THEN 1 END) AS overdue "
-            "FROM dbo.ElderArchive e JOIN dbo.Community c ON c.CommunityId=e.CommunityId "
-            "JOIN dbo.v_CurrentAbilityAssessment a ON a.ArchiveNo=e.ArchiveNo "
-            f"WHERE e.IsActive=1 AND {scope}", *params,
+    user = g.user
+    panels = []
+    if user["role"] == "community":
+        reassessments = query(
+            "SELECT ArchiveNo,FullName,AbilityLevel,ValidThrough,QueueStatus "
+            "FROM dbo.v_ReassessmentQueue WHERE CommunityId=? ORDER BY ValidThrough,ArchiveNo",
+            user["community_id"],
         )
-        stats = [("在册老人", data["total"]), ("评估有效", data["valid"]), ("评估过期", data["overdue"])]
-        recent = query(
-            "SELECT TOP (5) e.ArchiveNo,e.FullName,c.Name,a.AssessmentStatus "
-            "FROM dbo.ElderArchive e JOIN dbo.Community c ON c.CommunityId=e.CommunityId "
-            "JOIN dbo.v_CurrentAbilityAssessment a ON a.ArchiveNo=e.ArchiveNo "
-            f"WHERE e.IsActive=1 AND {scope} ORDER BY a.AssessmentDate DESC,e.ArchiveNo", *params,
+        pending = query(
+            "SELECT TOP (10) OrderId,ArchiveNo,ServiceName,AppointmentStart,Status FROM dbo.v_ServiceOrderOverview "
+            "WHERE CommunityId=? AND Status IN ('NEW','POOL') ORDER BY AppointmentStart,OrderId", user["community_id"],
         )
-        if g.user["role"] == "community":
-            today = beijing_today()
-            reassessments = query(
-                "SELECT e.ArchiveNo,e.FullName,a.AbilityLevel,a.ValidThrough "
-                "FROM dbo.ElderArchive e JOIN dbo.v_CurrentAbilityAssessment a ON a.ArchiveNo=e.ArchiveNo "
-                "WHERE e.IsActive=1 AND e.CommunityId=? AND a.ValidThrough BETWEEN ? AND ? "
-                "ORDER BY a.ValidThrough,e.ArchiveNo", g.user["community_id"], today, today + timedelta(days=14),
-            )
-    elif g.user["role"] == "agency":
-        count = one("SELECT COUNT(*) AS n FROM dbo.Worker WHERE AgencyId=?", g.user["agency_id"])
-        stats = [("机构护工", count["n"])]
-    elif g.user["role"] == "caregiver":
-        count = one("SELECT COUNT(*) AS n FROM dbo.WorkerRestriction WHERE WorkerId=? AND ResolvedAt IS NULL",
-                    g.user["worker_id"])
-        stats = [("待整改事项", count["n"])]
-    return render_template("dashboard.html", title="工作台", stats=stats, recent=recent, reassessments=reassessments)
+        for status, title in (("OVERDUE", "已过期待复评"), ("DUE_SOON", "14 天内到期待复评")):
+            entries = [row for row in reassessments if row["QueueStatus"] == status]
+            panels.append(dict(
+                title=title, columns=["档案编号", "姓名", "能力等级", "截止日期"],
+                rows=[(row["ArchiveNo"], row["FullName"], row["AbilityLevel"], row["ValidThrough"]) for row in entries],
+                row_links=[url_for("archive.detail", archive_no=row["ArchiveNo"], _anchor="assessment-form")
+                           for row in entries],
+            ))
+        panels.append(
+            dict(title="待派单", columns=["订单", "档案", "服务项目", "预约时间", "状态"],
+                 rows=[(row["OrderId"], row["ArchiveNo"], row["ServiceName"], row["AppointmentStart"],
+                        "待派单" if row["Status"] == "NEW" else "人工调度") for row in pending],
+                 row_links=[url_for("services.order_detail", order_id=row["OrderId"]) for row in pending],
+                 links=[("查看待派单", url_for("services.orders", status="NEW")),
+                        ("查看人工调度", url_for("services.orders", status="POOL"))]),
+        )
+    return workspace("工作台", f'{user["display_name"]} · {ROLE_NAMES[user["role"]]}', panels)

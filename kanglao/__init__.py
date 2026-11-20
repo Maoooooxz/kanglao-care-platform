@@ -13,6 +13,7 @@ from .db import close_db, one
 from .web import ROLE_NAMES, cell_display, check_csrf, csrf_token, status_class, status_label
 
 ROOT = Path(__file__).resolve().parents[1]
+APP_NAME = "北林之家·社区居家养老服务"
 LOCAL_CONNECTION = (
     r"Server=lpc:.\SQLEXPRESS;Database=KanglaoCourse;"
     "Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes"
@@ -39,7 +40,7 @@ def create_app(config=None):
     app.extensions["contacts"] = Fernet(app.config["CONTACT_KEY"].encode())
     app.teardown_appcontext(close_db)
     app.before_request(check_csrf)
-    app.jinja_env.globals.update(csrf_token=csrf_token, role_names=ROLE_NAMES,
+    app.jinja_env.globals.update(app_name=APP_NAME, csrf_token=csrf_token, role_names=ROLE_NAMES,
                                  cell_display=cell_display, status_class=status_class,
                                  status_label=status_label)
 

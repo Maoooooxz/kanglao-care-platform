@@ -1,20 +1,16 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="login-shell">
-  <section class="login-intro">
-    <div class="brand"><span class="brand-mark" aria-hidden="true">康</span><strong>康老</strong></div>
-    <h1>社区居家<br>养老服务</h1>
-    <p>一处办理照护安排、上门服务和社区监管。</p>
-  </section>
-  <section class="login-card">
-    <h2>登录工作台</h2>
-    <p>请输入为你分配的演示账号。</p>
-    <form method="post" class="form-grid">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <label>用户名<input required name="username" value="{{ username|default('') }}" autocomplete="username" maxlength="48"></label>
-      <label>密码<input required type="password" name="password" autocomplete="current-password" maxlength="128"></label>
-      <div><button type="submit">登录</button></div>
-    </form>
-  </section>
-</div>
+<section class="login-form">
+  <header>
+    <h1>{{ app_name }}</h1>
+    <p>登录工作台</p>
+  </header>
+  <form method="post" class="form-grid">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>用户名<input required name="username" value="{{ username|default('') }}" autocomplete="username" maxlength="48"></label>
+    <label>密码<input required type="password" name="password" autocomplete="current-password" maxlength="128"></label>
+    <div><button type="submit">登录</button></div>
+  </form>
+  <p class="demo-note">课程设计演示 · 页面中的人物与业务记录均为虚构</p>
+</section>
 {% endblock %}

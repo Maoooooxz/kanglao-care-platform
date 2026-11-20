@@ -21,7 +21,7 @@ DECLARE @ArchiveNo varchar(20) = 'E0001', @WorkerId int, @Order1 int, @Order2 in
 DECLARE @FamilyActor int = (SELECT TOP (1) UserId FROM dbo.AppUser WHERE Role = 'family'
                            AND Active = 1 AND ArchiveNo = @ArchiveNo ORDER BY UserId);
 IF @FamilyActor IS NULL THROW 51270, N'请先生成该档案对应的模拟家属账号。', 1;
-DECLARE @PackageId int = (SELECT PackageId FROM dbo.CarePackage WHERE Name = N'演示照护包001');
+DECLARE @PackageId int = (SELECT PackageId FROM dbo.CarePlan WHERE PlanNo='DEMO-PLAN-001');
 DECLARE @ServiceTypeId int = (SELECT ServiceTypeId FROM dbo.ServiceType WHERE Code = 'DEMO-SERVICE-001');
 DECLARE @AgencyId int = (SELECT AgencyId FROM dbo.Agency WHERE AgencyNo = 'DEMO-AGENCY-001');
 DECLARE @CommunityId int = (SELECT CommunityId FROM dbo.ElderArchive WHERE ArchiveNo = @ArchiveNo);

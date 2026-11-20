@@ -160,14 +160,13 @@ def index():
              _money(row["TotalAmount"]), CLAIM_STATES[row["Status"]])
             for row in claims[:size]
         ],
+        "actions": [("抽查结果公示", url_for("oversight.bulletins"))],
     }]
     if g.user["role"] == "community":
         panels.append(_order_form())
     if g.user["role"] in ("street", "civil"):
-        panels.append({"title": "辖区管理", "text": Markup(" · ").join([
-            _link("subsidy.policies", "补贴政策"),
-            _link("subsidy.quality", "质量抽查和服务覆盖"),
-        ])})
+        panels[0]["actions"].extend([("补贴政策", url_for("subsidy.policies")),
+                                     ("质量抽查和服务覆盖", url_for("subsidy.quality"))])
     return workspace("补贴申报", "按月归集服务，保留核算和审核记录", panels)
 
 
@@ -237,15 +236,17 @@ def detail(claim_id):
             evidence = json.loads(entry["EvidenceSnapshot"], parse_float=Decimal) if entry["EvidenceSnapshot"] else []
             if not evidence:
                 evidence_rows.append((entry["ChangedAt"], entry["DisplayName"], "历史证明未记录",
-                                      None, None, None, None, None, None))
+                                      None, None, None, None))
             for item in evidence:
+                signer = item.get("SignerName")
+                if not signer and item.get("ConfirmedBy") is not None:
+                    label = {"resident": "老人本人", "family": "家属"}.get(item.get("SignerRole"), "签字人")
+                    signer = f'{label} #{item["ConfirmedBy"]}'
                 evidence_rows.append((entry["ChangedAt"], entry["DisplayName"], item["OrderNo"] or f'#{item["OrderId"]}',
-                                      item["ServiceRecord"], item["EffectiveMinutes"], item["ConfirmedAt"],
-                                      item["ConfirmationHash"], f'#{item["PolicyId"]} · {_money(item["HourlyRate"])}/小时',
-                                      _money(item["Amount"])))
-        panels.append({"title": "申报证明归档", "text": "每次提交形成独立快照；凭据为服务确认摘要。",
-                       "columns": ["归档时间", "经办人", "订单", "服务记录", "有效分钟", "签字时间（UTC）",
-                                   "凭据摘要", "政策与费率", "补贴金额"], "rows": evidence_rows})
+                                      signer or "未记录", item["ConfirmedAt"], item["EffectiveMinutes"], _money(item["Amount"])))
+        panels.append({"title": "申报证明归档", "text": "每次提交保留一份独立证明。",
+                       "columns": ["归档时间", "经办人", "订单", "签字人", "签字时间（UTC）", "有效分钟", "补贴金额"],
+                       "rows": evidence_rows})
     if can_resubmit:
         panels.append(_order_form(claim, [row["OrderId"] for row in lines]))
     if can_review or can_pay:

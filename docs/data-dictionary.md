@@ -94,6 +94,7 @@
 | AfterCommunityId | int | 否 |   |
 | ActorUserId | int | 是 |   |
 | OccurredAt | datetime2(0) | 否 |  `(sysutcdatetime())` |
+| TransferReason | nvarchar(250) | 是 | 跨社区迁移原因 |
 
 - FK `FK__ArchiveAu__Actor__6D0D32F4` · `ActorUserId -> AppUser(UserId)`
 - FK `FK__ArchiveAu__Archi__6C190EBB` · `ArchiveNo -> ElderArchive(ArchiveNo)`
@@ -170,6 +171,9 @@
 | Latitude | decimal(9,6) | 否 |  `((40.008000))` |
 | Longitude | decimal(9,6) | 否 |  `((116.341000))` |
 | RadiusMeters | int | 否 |  `((3000))` |
+| CityName | nvarchar(30) | 是 | 所属城市 |
+| AreaName | nvarchar(80) | 是 | 行政区名 |
+| StreetName | nvarchar(80) | 是 | 所属街道 |
 
 - PK `PK_Community` · `CommunityId`
 
@@ -723,12 +727,13 @@
 | Grade | nvarchar(40) | 否 |   |
 | Rating | decimal(3,2) | 否 |  `((5))` |
 | TrainingCompletedOn | date | 是 |   |
-| IsActive | bit | 否 |  `((1))` |
+| EmploymentStatus | varchar(10) | 否 | `ON_DUTY`（在岗，默认）、`ON_LEAVE`（请假）、`LEFT`（离职） |
 
 - FK `FK__Worker__AgencyId__0E6E26BF` · `AgencyId -> Agency(AgencyId)`
 - PK `PK__Worker__077C882643AE5EE4` · `WorkerId`
 - UNIQUE `UQ__Worker__077F569C4A7EF9EB` · `WorkerNo`
 - CHECK `CK__Worker__Rating__10566F31` · `([Rating]>=(0) AND [Rating]<=(5))`
+- CHECK `CK_Worker_EmploymentStatus` · 仅允许在岗、请假、离职。
 
 ## WorkerCommunity
 

@@ -42,7 +42,8 @@ BEGIN
         Grade nvarchar(40) NOT NULL,
         Rating decimal(3,2) NOT NULL DEFAULT 5 CHECK (Rating BETWEEN 0 AND 5),
         TrainingCompletedOn date NULL,
-        IsActive bit NOT NULL DEFAULT 1
+        EmploymentStatus varchar(10) NOT NULL CONSTRAINT DF_Worker_EmploymentStatus DEFAULT 'ON_DUTY'
+            CONSTRAINT CK_Worker_EmploymentStatus CHECK (EmploymentStatus IN ('ON_DUTY','ON_LEAVE','LEFT'))
     );
 
     CREATE TABLE dbo.WorkerCommunity (
@@ -237,6 +238,30 @@ IF COL_LENGTH('dbo.ServiceVisit', 'ComplaintText') IS NULL
         ComplaintResolvedAt datetime2(0) NULL, ComplaintResolvedBy int NULL;
 IF COL_LENGTH('dbo.Worker', 'TrainingCompletedOn') IS NULL
     ALTER TABLE dbo.Worker ADD TrainingCompletedOn date NULL;
+IF COL_LENGTH('dbo.Worker', 'EmploymentStatus') IS NULL
+BEGIN
+    BEGIN TRANSACTION;
+    ALTER TABLE dbo.Worker ADD EmploymentStatus varchar(10) NOT NULL
+        CONSTRAINT DF_Worker_EmploymentStatus DEFAULT 'ON_DUTY'
+        CONSTRAINT CK_Worker_EmploymentStatus CHECK (EmploymentStatus IN ('ON_DUTY','ON_LEAVE','LEFT'));
+    IF COL_LENGTH('dbo.Worker', 'IsActive') IS NOT NULL
+    BEGIN
+        EXEC sys.sp_executesql N'UPDATE dbo.Worker SET EmploymentStatus=''ON_LEAVE'' WHERE IsActive=0;';
+        DECLARE @LegacyDefault sysname = (
+            SELECT defaults.name FROM sys.default_constraints defaults
+            JOIN sys.columns columnRow ON columnRow.object_id=defaults.parent_object_id
+                AND columnRow.column_id=defaults.parent_column_id
+            WHERE defaults.parent_object_id=OBJECT_ID(N'dbo.Worker') AND columnRow.name=N'IsActive'
+        );
+        IF @LegacyDefault IS NOT NULL
+        BEGIN
+            DECLARE @DropDefault nvarchar(max)=N'ALTER TABLE dbo.Worker DROP CONSTRAINT '+QUOTENAME(@LegacyDefault);
+            EXEC sys.sp_executesql @DropDefault;
+        END;
+        ALTER TABLE dbo.Worker DROP COLUMN IsActive;
+    END;
+    COMMIT;
+END;
 IF COL_LENGTH('dbo.ServiceType', 'CategoryCode') IS NULL
     ALTER TABLE dbo.ServiceType ADD CategoryCode varchar(12) NULL
         CONSTRAINT CK_ServiceType_Category CHECK (CategoryCode IN ('MEAL','BATH','ESCORT','HOUSEWORK','REHAB'));
@@ -335,7 +360,7 @@ SELECT o.OrderId, o.OrderNo, o.ArchiveNo, e.FullName, o.PlanId, o.ServiceTypeId,
        d.DispatchId, d.WorkerId, w.Name AS WorkerName, w.AgencyId, d.OfferExpiresAt, d.ClosedAt,
        v.CheckInAt, v.CheckOutAt, v.WorkStatus, v.EffectiveMinutes, v.ConfirmedAt, v.FeedbackScore, v.Feedback,
        v.ComplaintText, v.ComplainedAt, v.ComplaintResolution, v.ComplaintResolvedAt,
-       v.ServiceRecord, t.Subsidizable
+       v.ServiceRecord, t.Subsidizable, w.EmploymentStatus AS WorkerEmploymentStatus, v.ReviewReason AS WorkReviewReason
 FROM dbo.ServiceOrder o
 JOIN dbo.ElderArchive e ON e.ArchiveNo = o.ArchiveNo
 JOIN dbo.Community c ON c.CommunityId = o.CommunityId
@@ -414,12 +439,12 @@ GO
 
 CREATE OR ALTER PROCEDURE dbo.usp_RecordAbilityAssessment
     @AssessmentNo varchar(24), @ArchiveNo varchar(20), @ScaleCode varchar(8), @Score decimal(6,2),
-    @AbilityLevel nvarchar(20), @EvaluatorName nvarchar(100), @AssessmentDate date, @ValidThrough date
+    @AbilityLevel nvarchar(20), @EvaluatorName nvarchar(100), @AssessmentDate date, @ValidThrough date = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
-    IF @AssessmentDate > CONVERT(date, DATEADD(hour, 8, SYSUTCDATETIME()))
-        THROW 51101, N'评估日期不能晚于当天。', 1;
+    IF @AssessmentDate IS NULL OR @AssessmentDate > CONVERT(date, DATEADD(hour, 8, SYSUTCDATETIME()))
+        THROW 51101, N'评估日期不能为空或晚于当天。', 1;
 
     DECLARE @OwnTransaction bit = IIF(@@TRANCOUNT = 0, 1, 0);
     IF @OwnTransaction = 1 BEGIN TRANSACTION;
@@ -427,6 +452,15 @@ BEGIN
         EXEC dbo.usp_ServiceLock 'archive', @ArchiveNo;
         IF EXISTS (SELECT 1 FROM dbo.ElderArchive WHERE ArchiveNo = @ArchiveNo AND IsActive = 0)
             THROW 52002, N'档案已停用。', 1;
+        DECLARE @BirthDate date = (SELECT BirthDate FROM dbo.ElderArchive WHERE ArchiveNo=@ArchiveNo);
+        IF @BirthDate IS NULL OR @AssessmentDate<@BirthDate
+            THROW 51102, N'档案不存在或评估日期早于出生日期。', 1;
+        DECLARE @LatestEnd date = DATEADD(day,
+            CASE WHEN DATEDIFF(year,@BirthDate,@AssessmentDate)<80 THEN 180
+                 WHEN @AssessmentDate<DATEADD(year,80,@BirthDate) THEN 180 ELSE 90 END, @AssessmentDate);
+        SET @ValidThrough=COALESCE(@ValidThrough,@LatestEnd);
+        IF @ValidThrough<@AssessmentDate OR @ValidThrough>@LatestEnd
+            THROW 51103, N'有效期截止须在评估当天至该年龄段允许的最晚日期之间。', 1;
         INSERT dbo.AbilityAssessment(AssessmentNo, ArchiveNo, ScaleCode, Score, AbilityLevel,
                                      EvaluatorName, AssessmentDate, ValidThrough)
         VALUES (@AssessmentNo, @ArchiveNo, @ScaleCode, @Score, @AbilityLevel, @EvaluatorName, @AssessmentDate, @ValidThrough);
@@ -455,7 +489,7 @@ BEGIN
         SELECT 1 FROM dbo.v_CurrentAbilityAssessment a JOIN dbo.CarePackage p ON p.AbilityLevel = a.AbilityLevel
         JOIN dbo.ElderArchive e ON e.ArchiveNo = a.ArchiveNo
         JOIN dbo.WorkerCommunity wc ON wc.CommunityId = e.CommunityId AND wc.WorkerId = @WorkerId
-        JOIN dbo.Worker w ON w.WorkerId = wc.WorkerId AND w.IsActive = 1
+        JOIN dbo.Worker w ON w.WorkerId = wc.WorkerId AND w.EmploymentStatus = 'ON_DUTY'
         WHERE a.ArchiveNo = @ArchiveNo AND a.AssessmentStatus = N'有效' AND p.PackageId = @PackageId
             AND e.IsActive = 1 AND a.ValidThrough >= @StartsOn
             AND (@ActingCommunityId IS NULL OR e.CommunityId = @ActingCommunityId)
@@ -476,7 +510,7 @@ RETURNS TABLE AS RETURN
     SELECT s.ShiftId, s.WorkerId, s.WorkerName, s.AgencyId, s.Remaining
     FROM dbo.ServiceOrder o JOIN dbo.v_WorkerShiftAvailability s
         ON s.StartsAt <= o.AppointmentStart AND s.EndsAt >= o.AppointmentEnd
-    JOIN dbo.Worker w ON w.WorkerId = s.WorkerId AND w.IsActive = 1
+    JOIN dbo.Worker w ON w.WorkerId = s.WorkerId AND w.EmploymentStatus = 'ON_DUTY'
     JOIN dbo.WorkerCommunity c ON c.WorkerId = w.WorkerId AND c.CommunityId = o.CommunityId
     JOIN dbo.WorkerService cert ON cert.WorkerId = w.WorkerId AND cert.ServiceTypeId = o.ServiceTypeId
         AND cert.ValidFrom <= CONVERT(date, DATEADD(hour, 8, o.AppointmentStart))
@@ -561,6 +595,7 @@ BEGIN
         IF @DispatchId IS NOT NULL
         BEGIN
             IF @Reason IS NULL THROW 51213, N'改派须填写原因。', 1;
+            IF @AssignedWorker=@WorkerId THROW 51213, N'改派须选择另一位护工。', 1;
             UPDATE dbo.ServiceDispatch SET ClosedAt = @Now, CloseReason = @Reason WHERE DispatchId = @DispatchId;
         END;
         SET @ShiftId = (SELECT TOP (1) ShiftId FROM dbo.fn_EligibleServiceShifts(@OrderId)
@@ -608,9 +643,9 @@ BEGIN
                 THROW 51217, N'请先签退该护工正在进行的服务。', 1;
             IF NOT EXISTS (SELECT 1 FROM dbo.WorkerService s JOIN dbo.Worker w ON w.WorkerId = s.WorkerId
                            WHERE s.WorkerId = @WorkerId AND s.ServiceTypeId = @ServiceTypeId
-                               AND s.ValidFrom <= @Today AND s.ValidThrough >= @Today AND w.IsActive = 1)
+                               AND s.ValidFrom <= @Today AND s.ValidThrough >= @Today AND w.EmploymentStatus = 'ON_DUTY')
                 OR EXISTS (SELECT 1 FROM dbo.WorkerRestriction WHERE WorkerId = @WorkerId AND ResolvedAt IS NULL)
-                THROW 51214, N'护工资质失效或尚有整改限制。', 1;
+                THROW 51214, N'护工不在岗、资质失效或尚有整改限制。', 1;
             INSERT dbo.ServiceVisit(OrderId, DispatchId, WorkerId, CheckInAt, InLatitude, InLongitude, InFence, InShift,
                                     WorkStatus, SubsidyCategory, SubsidyAbilityLevel)
             SELECT @OrderId, @DispatchId, @WorkerId, @Now, @Latitude, @Longitude, @InFence, @InShift,
@@ -798,6 +833,9 @@ BEGIN
         UPDATE p SET Status = 'ACTIVE', ChangedReason = @Reason
         FROM dbo.CarePlan p JOIN dbo.CarePackage k ON p.PackageId = k.PackageId
         JOIN dbo.v_CurrentAbilityAssessment a ON a.ArchiveNo = p.ArchiveNo AND a.AbilityLevel = k.AbilityLevel
+        JOIN dbo.ElderArchive elder ON elder.ArchiveNo=p.ArchiveNo AND elder.IsActive=1
+        JOIN dbo.WorkerCommunity coverage ON coverage.WorkerId=p.ResponsibleWorkerId AND coverage.CommunityId=elder.CommunityId
+        JOIN dbo.Worker worker ON worker.WorkerId=p.ResponsibleWorkerId AND worker.EmploymentStatus='ON_DUTY'
         WHERE p.PlanId = @PlanId AND p.Status = 'PAUSED' AND a.AssessmentStatus = N'有效'
             AND p.EndsOn >= CONVERT(date, DATEADD(hour, 8, SYSUTCDATETIME()));
     ELSE THROW 51205, N'未知计划操作。', 1;
@@ -816,7 +854,7 @@ BEGIN
         THROW 51206, N'请填写有效时段和接单上限。', 1;
     BEGIN TRANSACTION;
     EXEC dbo.usp_ServiceLock 'worker', @WorkerKey;
-    IF NOT EXISTS (SELECT 1 FROM dbo.Worker WHERE WorkerId = @WorkerId AND IsActive = 1)
+    IF NOT EXISTS (SELECT 1 FROM dbo.Worker WHERE WorkerId = @WorkerId AND EmploymentStatus = 'ON_DUTY')
         THROW 51206, N'护工须为在岗状态。', 1;
     IF EXISTS (SELECT 1 FROM dbo.WorkerShift WHERE WorkerId = @WorkerId AND IsOpen = 1
                AND StartsAt < @EndsAt AND EndsAt > @StartsAt)
@@ -849,6 +887,26 @@ BEGIN
     IF @@ROWCOUNT = 0
         INSERT dbo.WorkerService(WorkerId, ServiceTypeId, CredentialNo, ValidFrom, ValidThrough, CredentialType, CredentialLevel)
         VALUES (@WorkerId, @ServiceTypeId, @CredentialNo, @ValidFrom, @ValidThrough, @CredentialType, @CredentialLevel);
+    COMMIT;
+END;
+GO
+
+CREATE OR ALTER PROCEDURE dbo.usp_SetWorkerEmploymentStatus
+    @WorkerId int, @ActorId int, @EmploymentStatus varchar(10)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    IF @EmploymentStatus IS NULL OR @EmploymentStatus NOT IN ('ON_DUTY','ON_LEAVE','LEFT')
+        THROW 51226, N'请选择有效的护工状态。', 1;
+    DECLARE @WorkerKey nvarchar(40)=CONVERT(nvarchar(40),@WorkerId);
+    BEGIN TRANSACTION;
+    EXEC dbo.usp_ServiceLock 'worker', @WorkerKey;
+    UPDATE worker SET EmploymentStatus=@EmploymentStatus
+    FROM dbo.Worker worker JOIN dbo.AppUser actor ON actor.AgencyId=worker.AgencyId
+        AND actor.UserId=@ActorId AND actor.Active=1 AND actor.Role='agency'
+    WHERE worker.WorkerId=@WorkerId;
+    IF @@ROWCOUNT<>1 THROW 51226, N'只能调整本机构护工的状态。', 1;
     COMMIT;
 END;
 GO

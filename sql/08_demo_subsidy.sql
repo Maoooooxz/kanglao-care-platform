@@ -37,7 +37,7 @@ WITH pairs AS (
 )
 INSERT dbo.SubsidyPolicy (PolicyName, District, ServiceTypeId, ValidFrom, ValidThrough, HourlyRate, MaxPerOrder,
                           BeneficiaryCategory, AbilityLevel)
-SELECT LEFT(CONCAT(IIF(pairs.Category = 'ANY', N'演示通用补贴 ', N'演示低保重度补贴 '), pairs.Name), 100),
+SELECT LEFT(CONCAT(IIF(pairs.Category = 'ANY', N'居家养老服务补贴｜', N'低保重度失能上门照护补贴｜'), pairs.Name), 100),
        pairs.District, pairs.ServiceTypeId, '20200101', '20991231', pairs.Rate, 80.00, pairs.Category, pairs.AbilityLevel
 FROM pairs
 WHERE NOT EXISTS (
@@ -46,6 +46,14 @@ WHERE NOT EXISTS (
       AND existing.BeneficiaryCategory = pairs.Category AND existing.AbilityLevel = pairs.AbilityLevel
       AND existing.ValidFrom <= '20991231' AND existing.ValidThrough >= '20200101'
 );
+
+UPDATE policy SET PolicyName=LEFT(CONCAT(IIF(policy.BeneficiaryCategory='ANY',
+    N'居家养老服务补贴｜',N'低保重度失能上门照护补贴｜'),service.Name),100)
+FROM dbo.SubsidyPolicy policy JOIN dbo.ServiceType service ON service.ServiceTypeId=policy.ServiceTypeId
+WHERE policy.ValidFrom='20200101' AND policy.MaxPerOrder=80
+  AND (policy.PolicyName LIKE N'演示通用补贴 %' OR policy.PolicyName LIKE N'演示低保重度补贴 %'
+       OR policy.PolicyName LIKE N'演示补贴政策 %')
+  AND EXISTS (SELECT 1 FROM #DemoSubsidyVisits visit WHERE visit.District=policy.District AND visit.ServiceTypeId=policy.ServiceTypeId);
 
 COMMIT TRANSACTION;
 
@@ -82,14 +90,14 @@ BEGIN
     IF @Street IS NOT NULL
     BEGIN
         IF @DemoNumber % 5 = 0
-            EXEC dbo.usp_ProgressSubsidyClaim @Street, @ClaimId, 'return', N'演示退回，请复核订单材料。';
+            EXEC dbo.usp_ProgressSubsidyClaim @Street, @ClaimId, 'return', N'请补充服务记录中的上门内容后重新提交。';
         ELSE IF @DemoNumber % 5 IN (2, 3, 4)
         BEGIN
-            EXEC dbo.usp_ProgressSubsidyClaim @Street, @ClaimId, 'approve', N'演示街道审核通过';
+            EXEC dbo.usp_ProgressSubsidyClaim @Street, @ClaimId, 'approve', N'核对订单、工时和签字记录，街道审核通过。';
             IF @Civil IS NOT NULL AND @DemoNumber % 5 IN (3, 4)
-                EXEC dbo.usp_ProgressSubsidyClaim @Civil, @ClaimId, 'approve', N'演示民政审核通过';
+                EXEC dbo.usp_ProgressSubsidyClaim @Civil, @ClaimId, 'approve', N'核算金额符合该月适用政策。';
             IF @Civil IS NOT NULL AND @DemoNumber % 5 = 4
-                EXEC dbo.usp_ProgressSubsidyClaim @Civil, @ClaimId, 'pay', N'演示已拨付';
+                EXEC dbo.usp_ProgressSubsidyClaim @Civil, @ClaimId, 'pay', N'已登记本期模拟拨付。';
         END;
     END;
     FETCH NEXT FROM demo_claims INTO @ArchiveNo, @CommunityId, @ServiceTypeId, @PeriodMonth, @OrderIdsJson;
@@ -106,11 +114,20 @@ WITH first_visits AS (
 ), inspections AS (
     SELECT TOP (20) OrderId, WorkerId, District, CheckOutAt,
            ROW_NUMBER() OVER (ORDER BY OrderId) AS Position,
-           CONCAT(N'演示抽查整改 ', OrderId) AS Finding
+           CONCAT(N'演示抽查整改 ',OrderId) AS LegacyFinding,
+           CONCAT(N'订单 #',OrderId,N'：',CHOOSE(OrderId%3+1,N'服务记录缺少结束时的交接说明。',
+                N'请补记家属回访情况，以便复查。',N'服务记录中已完成的项目填写不完整。')) AS Finding
     FROM first_visits WHERE WorkerVisitNumber = 1
     ORDER BY OrderId
 )
 SELECT * INTO #DemoInspections FROM inspections;
+
+UPDATE restriction SET Reason=sample.Finding
+FROM dbo.WorkerRestriction restriction JOIN #DemoInspections sample
+    ON sample.WorkerId=restriction.WorkerId AND sample.LegacyFinding=restriction.Reason;
+UPDATE inspection SET Finding=sample.Finding
+FROM dbo.ServiceInspection inspection JOIN #DemoInspections sample
+    ON sample.OrderId=inspection.OrderId AND sample.WorkerId=inspection.WorkerId AND sample.LegacyFinding=inspection.Finding;
 
 INSERT dbo.WorkerRestriction (WorkerId, Reason, CreatedAt, ResolvedAt)
 SELECT sample.WorkerId, sample.Finding, DATEADD(hour, 1, sample.CheckOutAt),

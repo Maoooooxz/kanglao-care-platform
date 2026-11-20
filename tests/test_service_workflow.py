@@ -65,22 +65,25 @@ def test_http_service_lifecycle_through_subsidy_payment(application, password, s
             area = one("""
                 SELECT c.CommunityId,c.Latitude,c.Longitude,p.PackageId,p.AbilityLevel,t.ServiceTypeId,a.AgencyId
                 FROM dbo.AppUser u JOIN dbo.Community c ON c.CommunityId=u.CommunityId
-                CROSS JOIN dbo.CarePackage p CROSS JOIN dbo.ServiceType t CROSS JOIN dbo.Agency a
-                WHERE u.Username='community' AND p.Name=N'演示照护包001'
+                CROSS JOIN dbo.CarePlan planRow JOIN dbo.CarePackage p ON p.PackageId=planRow.PackageId
+                CROSS JOIN dbo.ServiceType t CROSS JOIN dbo.Agency a
+                WHERE u.Username='community' AND planRow.PlanNo='DEMO-PLAN-001'
                   AND t.Code='DEMO-SERVICE-001' AND a.AgencyNo='DEMO-AGENCY-001'
             """)
             assert area is not None, "请先装载演示账号、服务包和机构"
 
         _post(community, "/archives/", op="create", archive_no=archive_no, id_number=id_number,
-              name="流程验证老人", birth_date="1950-01-01", address="流程验证地址",
-              latitude=str(area["Latitude"]), longitude=str(area["Longitude"]), subsidy_category="LOW_INCOME")
+              name="流程验证老人", birth_date=f"{today.year - 70}-01-01", address="流程验证地址",
+              subsidy_category="LOW_INCOME")
         with application.app_context():
-            assert one("SELECT ArchiveNo FROM dbo.ElderArchive WHERE ArchiveNo=?", archive_no) is not None
+            assert one("SELECT Latitude,Longitude FROM dbo.ElderArchive WHERE ArchiveNo=?", archive_no) == {
+                "Latitude": area["Latitude"], "Longitude": area["Longitude"],
+            }
         _post(community, f"/archives/{archive_no}", op="assessment", scale="ADL", score="75",
-              level=area["AbilityLevel"], assessment_date=today.isoformat(), valid_through=valid_through.isoformat())
+              level=area["AbilityLevel"], assessment_date=today.isoformat(), valid_through="")
         with application.app_context():
-            assessment = one("SELECT AssessmentStatus FROM dbo.v_CurrentAbilityAssessment WHERE ArchiveNo=?", archive_no)
-            assert assessment["AssessmentStatus"] == "有效"
+            assessment = one("SELECT AssessmentStatus,ValidThrough FROM dbo.v_CurrentAbilityAssessment WHERE ArchiveNo=?", archive_no)
+            assert assessment == {"AssessmentStatus": "有效", "ValidThrough": today + timedelta(days=180)}
 
         with application.app_context(), transaction():
             worker_id = one("INSERT dbo.Worker(WorkerNo,AgencyId,Name,Grade) OUTPUT inserted.WorkerId VALUES(?,?,?,?)",
@@ -104,7 +107,7 @@ def test_http_service_lifecycle_through_subsidy_payment(application, password, s
             assert one("SELECT PlanId FROM dbo.CarePlan WHERE ArchiveNo=? AND Status='ACTIVE'", archive_no)
 
         log_in(signer, signer_name, password)
-        _post(signer, "/services/orders", operation="BOOK", archive_no=archive_no,
+        _post(signer, "/services/orders/book", archive_no=archive_no,
               service_type_id=area["ServiceTypeId"], start=appointment.astimezone(SHANGHAI).isoformat(timespec="seconds"),
               end=booking_end.astimezone(SHANGHAI).isoformat(timespec="seconds"))
         with application.app_context():
@@ -112,40 +115,46 @@ def test_http_service_lifecycle_through_subsidy_payment(application, password, s
             assert order is not None and order["Status"] == "NEW" and order["Channel"] == "FAMILY"
             order_id = order["OrderId"]
 
-        _post(community, "/services/orders", operation="DISPATCH", order_id=order_id, worker_id=worker_id)
+        order_path = f"/services/orders/{order_id}"
+        assert "流程验证护工" in community.get(order_path).get_data(as_text=True)
+        _post(community, order_path, operation="DISPATCH", worker_id=worker_id)
         with application.app_context():
             assert one("SELECT Status FROM dbo.ServiceOrder WHERE OrderId=?", order_id)["Status"] == "OFFERED"
         log_in(caregiver, worker_name, password)
-        assert submit(caregiver, "/services/orders", operation="CONFIRM", order_id=order_id, reason="越权验证").status_code == 403
-        _post(caregiver, "/services/orders", operation="ACCEPT", order_id=order_id)
+        assert submit(caregiver, order_path, operation="CONFIRM", reason="越权验证").status_code == 403
+        _post(caregiver, order_path, operation="ACCEPT")
 
         with application.app_context():
             assert one("SELECT Status FROM dbo.ServiceOrder WHERE OrderId=?", order_id)["Status"] == "ACCEPTED"
             # 保留真实 HTTP 操作，在独立 QA 数据库推进这份预约至当前可签到时段。
             execute("UPDATE dbo.ServiceOrder SET AppointmentStart=DATEADD(minute,-2,SYSUTCDATETIME()) WHERE OrderId=?",
                     order_id)
-        _post(caregiver, "/services/orders", operation="CHECK_IN", order_id=order_id)
+        _post(caregiver, order_path, operation="CHECK_IN")
         with application.app_context():
             assert one("SELECT Status FROM dbo.ServiceOrder WHERE OrderId=?", order_id)["Status"] == "IN_SERVICE"
             execute("UPDATE dbo.ServiceVisit SET CheckInAt=DATEADD(minute,-3,SYSUTCDATETIME()) WHERE OrderId=?", order_id)
-        _post(caregiver, "/services/orders", operation="CHECK_OUT", order_id=order_id, reason="模拟上门服务完成")
+        manager = application.test_client()
+        log_in(manager, "agency", password)
+        _post(manager, "/services/workers", operation="EMPLOYMENT", worker_id=worker_id, employment_status="LEFT")
+        with application.app_context():
+            assert one("SELECT EmploymentStatus FROM dbo.Worker WHERE WorkerId=?", worker_id)["EmploymentStatus"] == "LEFT"
+        assert "模拟离场签退" in caregiver.get(order_path).get_data(as_text=True)
+        _post(caregiver, order_path, operation="CHECK_OUT", reason="模拟上门服务完成")
         with application.app_context():
             assert one("SELECT Status FROM dbo.ServiceOrder WHERE OrderId=?", order_id)["Status"] == "AWAITING_CONFIRMATION"
             assert one("SELECT OrderId FROM dbo.v_SubsidyEligibleOrder WHERE OrderId=?", order_id) is None
 
         outsider = application.test_client()
         log_in(outsider, "resident", password)
-        order_path = f"/services/orders/{order_id}"
         assert outsider.get(order_path).status_code == 404
         assert submit(outsider, order_path, operation="CONFIRM", reason="无权签字").status_code == 404
-        assert submit(outsider, "/services/orders", operation="CONFIRM", order_id=order_id,
-                      reason="无权签字").status_code == 404
         signature_label = "家属电子签字" if signer_role == "family" else "老人本人电子签字"
-        assert signature_label in signer.get("/services/orders?status=AWAITING_CONFIRMATION").get_data(as_text=True)
+        assert signature_label not in signer.get("/services/orders?status=AWAITING_CONFIRMATION").get_data(as_text=True)
         details = signer.get(order_path).get_data(as_text=True)
         assert "模拟上门服务完成" in details and signature_label in details and "待核定" in details
+        assert details.count('name="operation" value="CONFIRM"') == 1
         _post(signer, order_path, operation="CONFIRM", reason="模拟签名")
-        _post(signer, "/services/orders", operation="CONFIRM", order_id=order_id, reason="重复签名不应覆盖")
+        _post(signer, order_path, operation="CONFIRM", reason="重复签名不应覆盖")
         with application.app_context():
             eligible = one("""SELECT OrderId,WorkerId,EffectiveMinutes,SubsidyCategory,SubsidyAbilityLevel
                             FROM dbo.v_SubsidyEligibleOrder WHERE OrderId=?""", order_id)
@@ -169,7 +178,8 @@ def test_http_service_lifecycle_through_subsidy_payment(application, password, s
         log_in(street, "street", password)
         log_in(civil, "civil", password)
         claim_page = street.get(path)
-        assert claim_page.status_code == 200 and "申报证明归档" in claim_page.get_data(as_text=True)
+        claim_content = claim_page.get_data(as_text=True)
+        assert claim_page.status_code == 200 and "申报证明归档" in claim_content and "流程验证签字人" in claim_content
         assert "待核定" in signer.get(order_path).get_data(as_text=True)
         _post(street, path, operation="review", action="return", note="请补充说明")
         with application.app_context():
@@ -182,6 +192,7 @@ def test_http_service_lifecycle_through_subsidy_payment(application, password, s
                                AND updated.LogId>old.LogId ORDER BY old.LogId,updated.LogId""", claim["ClaimId"])
             original, revised = (json.loads(snapshots[key])[0] for key in ("Original", "Revised"))
             assert original["ServiceRecord"] == "模拟上门服务完成" and len(original["ConfirmationHash"]) == 64
+            assert original["ConfirmationHash"] not in claim_content
             assert revised["ServiceRecord"] == "重新提交的服务说明"
         _post(street, path, operation="review", action="approve", note="街道审核通过")
         _post(civil, path, operation="review", action="approve", note="民政审核通过")

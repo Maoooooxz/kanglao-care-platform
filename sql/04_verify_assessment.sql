@@ -8,7 +8,7 @@ IF DB_NAME() <> N'KanglaoCourse' OR @@TRANCOUNT <> 0
     THROW 51200, N'请在 KanglaoCourse 数据库的无活动事务会话中运行验证。', 1;
 
 DECLARE @ArchiveNo varchar(20) = 'VERIFY-ASSESS-01';
-DECLARE @Today date = CONVERT(date, SYSDATETIME());
+DECLARE @Today date = CONVERT(date,DATEADD(hour,8,SYSUTCDATETIME()));
 DECLARE @Yesterday date = DATEADD(day, -1, @Today);
 DECLARE @TwoDaysAgo date = DATEADD(day, -2, @Today);
 DECLARE @Tomorrow date = DATEADD(day, 1, @Today);
@@ -76,6 +76,21 @@ BEGIN TRY
     )
         THROW 51207, N'未来评估不能取代当天的当前评估。', 1;
 
+    UPDATE dbo.ElderArchive SET BirthDate=DATEADD(year,-80,@Today) WHERE ArchiveNo=@ArchiveNo;
+    EXEC dbo.usp_RecordAbilityAssessment
+        'VERIFY-ASSESS-AGE-BEFORE', @ArchiveNo, 'ADL', 75, N'轻度失能', N'验证评估员', @Yesterday;
+    EXEC dbo.usp_RecordAbilityAssessment
+        'VERIFY-ASSESS-AGE-80', @ArchiveNo, 'ADL', 75, N'轻度失能', N'验证评估员', @Today;
+    IF NOT EXISTS (
+        SELECT 1 FROM dbo.AbilityAssessment WHERE AssessmentNo='VERIFY-ASSESS-AGE-BEFORE'
+            AND ValidThrough=DATEADD(day,180,@Yesterday)
+    ) OR NOT EXISTS (
+        SELECT 1 FROM dbo.AbilityAssessment WHERE AssessmentNo='VERIFY-ASSESS-AGE-80'
+            AND ValidThrough=DATEADD(day,90,@Today)
+    ) OR NOT EXISTS (
+        SELECT 1 FROM dbo.AbilityAssessment WHERE AssessmentNo='VERIFY-ASSESS-TIE-A' AND ValidThrough=@Tomorrow
+    ) THROW 51207, N'80 岁前后默认期限有误，或已有评估截止日被修改。', 1;
+
     DECLARE @InvalidCases TABLE (
         CaseName nvarchar(30),
         AssessmentNo varchar(24),
@@ -89,10 +104,11 @@ BEGIN TRY
 
     INSERT INTO @InvalidCases
     VALUES
-        (N'无对应档案', 'VERIFY-ASSESS-FK', 'VERIFY-ASSESS-MISS', 'ADL', 60, @Today, @Tomorrow, 547),
+        (N'无对应档案', 'VERIFY-ASSESS-FK', 'VERIFY-ASSESS-MISS', 'ADL', 60, @Today, @Tomorrow, 51102),
         (N'无效量表', 'VERIFY-ASSESS-SCALE', @ArchiveNo, 'INVALID', 60, @Today, @Tomorrow, 547),
         (N'负数得分', 'VERIFY-ASSESS-SCORE', @ArchiveNo, 'ADL', -1, @Today, @Tomorrow, 547),
-        (N'截止日早于评估日', 'VERIFY-ASSESS-PERIOD', @ArchiveNo, 'ADL', 60, @Today, @Yesterday, 547),
+        (N'截止日早于评估日', 'VERIFY-ASSESS-PERIOD', @ArchiveNo, 'ADL', 60, @Today, @Yesterday, 51103),
+        (N'截止日超过年龄上限', 'VERIFY-ASSESS-TOO-LONG', @ArchiveNo, 'ADL', 60, @Today, DATEADD(day,91,@Today), 51103),
         (N'重复评估编号', 'VERIFY-ASSESS-OLD', @ArchiveNo, 'ADL', 60, @Today, @Tomorrow, 2627),
         (N'未来评估', 'VERIFY-ASSESS-FUTURE', @ArchiveNo, 'ADL', 60, @Tomorrow, @Tomorrow, 51101);
 

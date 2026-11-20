@@ -64,16 +64,19 @@ BEGIN TRY
             THROW;
     END CATCH;
 
-    UPDATE dbo.ElderArchive
-    SET CommunityId = 2
-    WHERE ArchiveNo = @ArchiveNo;
+    DECLARE @Operator int=(SELECT UserId FROM dbo.AppUser WHERE Username='community01');
+    DECLARE @Latitude decimal(9,6), @Longitude decimal(9,6);
+    SELECT @Latitude=Latitude,@Longitude=Longitude FROM dbo.Community WHERE CommunityId=2;
+    EXEC dbo.usp_TransferElderArchive @ArchiveNo,@Operator,2,N'验证迁入地址',@Latitude,@Longitude,N'验证迁移原因';
 
-    IF @@ROWCOUNT <> 1
-        THROW 51007, N'社区迁移应更新一份已有档案。', 1;
+    IF NOT EXISTS (SELECT 1 FROM dbo.v_ElderTransferHistory WHERE ArchiveNo=@ArchiveNo
+                    AND BeforeCommunityId=1 AND AfterCommunityId=2 AND TransferReason=N'验证迁移原因'
+                    AND OperatorName IS NOT NULL)
+        THROW 51007, N'社区迁移应留下原社区、迁入社区、操作账号和原因。', 1;
 
     IF NOT EXISTS (
         SELECT 1 FROM dbo.ElderArchive
-        WHERE IdNumber = @IdNumber AND ArchiveNo = @ArchiveNo AND CommunityId = 2
+        WHERE IdNumber = @IdNumber AND ArchiveNo = @ArchiveNo AND CommunityId = 2 AND Address=N'验证迁入地址'
     ) OR NOT EXISTS (
         SELECT 1 FROM dbo.v_ElderArchiveSummary AS summary
         INNER JOIN dbo.Community AS community ON community.CommunityId = 2

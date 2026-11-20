@@ -44,18 +44,30 @@ BEGIN
 
     BEGIN TRANSACTION;
 
-    INSERT dbo.HealthThreshold (MetricCode, MetricName, UnitLabel, MinimumValue, MaximumValue, TriageMinutes, Severity)
-    SELECT demo.MetricCode, CASE demo.RowNo WHEN 1 THEN N'心率演示' WHEN 2 THEN N'体温演示'
-           WHEN 3 THEN N'血压演示' WHEN 4 THEN N'血氧演示' ELSE CONCAT(N'模拟指标 ', demo.RowNo) END,
-           N'模拟单位', 0, 100, 5, (demo.RowNo - 1) % 3 + 1
-    FROM @Demo AS demo
-    WHERE NOT EXISTS (SELECT 1 FROM dbo.HealthThreshold AS t WHERE t.MetricCode = demo.MetricCode);
+    DECLARE @SignalNames table (MetricCode varchar(24) PRIMARY KEY, MetricName nvarchar(60), LegacyName nvarchar(60));
+    INSERT @SignalNames
+    SELECT demo.MetricCode, CHOOSE((demo.RowNo-1)%6+1,N'脉搏监测',N'体温监测',N'血压监测',N'血氧监测',N'呼吸监测',N'活动监测'),
+           CASE demo.RowNo WHEN 1 THEN N'心率演示' WHEN 2 THEN N'体温演示'
+           WHEN 3 THEN N'血压演示' WHEN 4 THEN N'血氧演示' ELSE CONCAT(N'模拟指标 ', demo.RowNo) END
+    FROM @Demo AS demo;
+    INSERT @SignalNames VALUES ('DEMO-SYSTOLIC',N'收缩压监测',N'血压演示'),
+                               ('DEMO-ECG-RATE',N'心电贴心率',N'心电演示'), ('DEMO-FALL',N'跌倒雷达信号',N'跌倒事件演示');
 
     INSERT dbo.HealthThreshold (MetricCode, MetricName, UnitLabel, MinimumValue, MaximumValue, TriageMinutes, Severity)
-    SELECT metric.Code, metric.Label, N'模拟单位', 0, metric.NormalMax, 5, metric.Severity
-    FROM (VALUES ('DEMO-SYSTOLIC',N'血压演示',100,1), ('DEMO-ECG-RATE',N'心电演示',100,2),
-                 ('DEMO-FALL',N'跌倒事件演示',0,3)) metric(Code,Label,NormalMax,Severity)
+    SELECT demo.MetricCode, signal.MetricName, N'模拟单位', 0, 100, 5, (demo.RowNo - 1) % 3 + 1
+    FROM @Demo AS demo JOIN @SignalNames signal ON signal.MetricCode=demo.MetricCode
+    WHERE NOT EXISTS (SELECT 1 FROM dbo.HealthThreshold AS t WHERE t.MetricCode=demo.MetricCode);
+
+    INSERT dbo.HealthThreshold (MetricCode, MetricName, UnitLabel, MinimumValue, MaximumValue, TriageMinutes, Severity)
+    SELECT metric.Code, signal.MetricName, N'模拟单位', 0, metric.NormalMax, 5, metric.Severity
+    FROM (VALUES ('DEMO-SYSTOLIC',100,1), ('DEMO-ECG-RATE',100,2), ('DEMO-FALL',0,3)) metric(Code,NormalMax,Severity)
+    JOIN @SignalNames signal ON signal.MetricCode=metric.Code
     WHERE NOT EXISTS (SELECT 1 FROM dbo.HealthThreshold threshold WHERE threshold.MetricCode=metric.Code);
+
+    UPDATE threshold SET MetricName=signal.MetricName
+    FROM dbo.HealthThreshold threshold JOIN @SignalNames signal ON signal.MetricCode=threshold.MetricCode
+    WHERE threshold.MetricName=signal.LegacyName AND threshold.UnitLabel=N'模拟单位'
+      AND threshold.MetricName<>signal.MetricName;
 
     INSERT dbo.HealthResponseRule (CommunityId, Severity, ResponseMinutes)
     SELECT c.CommunityId, levels.Severity, levels.ResponseMinutes
@@ -70,7 +82,8 @@ BEGIN
     WHERE NOT EXISTS (SELECT 1 FROM dbo.HealthDevice AS d WHERE d.DeviceCode = demo.DeviceCode);
 
     INSERT dbo.HealthBinding (DeviceId, ArchiveNo, StartsAt, InstallationLocation)
-    SELECT device.DeviceId, demo.ArchiveNo, DATEADD(day, -30, @Now), N'演示居所'
+    SELECT device.DeviceId, demo.ArchiveNo, DATEADD(day, -30, @Now),
+           CHOOSE((demo.RowNo-1)%3+1,N'客厅电视柜旁',N'卧室床头',N'入户走廊')
     FROM @Demo AS demo JOIN dbo.HealthDevice AS device ON device.DeviceCode = demo.DeviceCode
     WHERE NOT EXISTS (SELECT 1 FROM dbo.HealthBinding AS b WHERE b.DeviceId = device.DeviceId);
 
@@ -80,11 +93,17 @@ BEGIN
                  ('DEMO-MODEL-FALL','FALL_RADAR'),('DEMO-MODEL-SOS','SOS')) model(DeviceCode,DeviceType)
     WHERE NOT EXISTS (SELECT 1 FROM dbo.HealthDevice device WHERE device.DeviceCode=model.DeviceCode);
     INSERT dbo.HealthBinding(DeviceId,ArchiveNo,StartsAt,InstallationLocation)
-    SELECT device.DeviceId,elder.ArchiveNo,DATEADD(day,-30,@Now),N'演示居所'
+    SELECT device.DeviceId,elder.ArchiveNo,DATEADD(day,-30,@Now),
+           CASE device.DeviceType WHEN 'SOS' THEN N'卧室床头' WHEN 'FALL_RADAR' THEN N'入户走廊' ELSE N'客厅电视柜旁' END
     FROM dbo.HealthDevice device CROSS JOIN @Elders elder
     WHERE elder.RowNo=1 AND device.IsDemo=1
       AND device.DeviceCode IN ('DEMO-MODEL-BP','DEMO-MODEL-ECG','DEMO-MODEL-FALL','DEMO-MODEL-SOS')
       AND NOT EXISTS (SELECT 1 FROM dbo.HealthBinding binding WHERE binding.DeviceId=device.DeviceId);
+
+    UPDATE binding SET InstallationLocation=CHOOSE((demo.RowNo-1)%3+1,N'客厅电视柜旁',N'卧室床头',N'入户走廊')
+    FROM dbo.HealthBinding binding JOIN dbo.HealthDevice device ON device.DeviceId=binding.DeviceId
+    JOIN @Demo demo ON demo.DeviceCode=device.DeviceCode AND demo.ArchiveNo=binding.ArchiveNo
+    WHERE binding.InstallationLocation=N'演示居所' AND device.IsDemo=1;
 
     UPDATE device SET IsDemo=1
     FROM dbo.HealthDevice device JOIN @Demo demo ON demo.DeviceCode=device.DeviceCode
@@ -129,11 +148,18 @@ BEGIN
            CASE WHEN demo.RowNo <= 16 THEN demo.CommunityUserId END,
            CASE WHEN demo.RowNo <= 8 THEN DATEADD(minute, 2, timing.OpenedAt) END,
            CASE WHEN demo.RowNo <= 8 THEN DATEADD(minute, 3, timing.OpenedAt) END,
-           CASE WHEN demo.RowNo <= 8 THEN N'演示处置已记录' END,
+           CASE WHEN demo.RowNo <= 8 THEN CHOOSE((demo.RowNo-1)%3+1,
+                N'值班员回拨确认，已联系家属到家查看。',N'已到场检查呼叫设备，并和老人确认使用方法。',
+                N'社区人员到场，向家属记录并反馈处理情况。') END,
            CASE WHEN demo.RowNo <= 16 THEN demo.CommunityUserId END
     FROM @Demo AS demo
     CROSS APPLY (SELECT DATEADD(minute, -60 - demo.RowNo, @Now) AS OpenedAt) AS timing
     WHERE NOT EXISTS (SELECT 1 FROM dbo.HealthEvent AS e WHERE e.RequestKey = demo.RequestKey);
+
+    UPDATE evt SET Resolution=CHOOSE((demo.RowNo-1)%3+1,N'值班员回拨确认，已联系家属到家查看。',
+        N'已到场检查呼叫设备，并和老人确认使用方法。',N'社区人员到场，向家属记录并反馈处理情况。')
+    FROM dbo.HealthEvent evt JOIN @Demo demo ON demo.RequestKey=evt.RequestKey AND demo.ArchiveNo=evt.ArchiveNo
+    WHERE evt.Origin='DEMO' AND evt.Resolution=N'演示处置已记录';
 
     COMMIT TRANSACTION;
 END;

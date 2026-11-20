@@ -18,7 +18,7 @@ def test_sampling_publication_and_assessment_pages(application, password):
     assert application.test_client().get(output).status_code == 302
     published = family.get(output).get_data(as_text=True)
     assert "课设抽查演示区" in published
-    for private in ("E0001", "DEMO-COURSE-", "抽查样例老人", "抽查样例护工", "合成服务记录核查通过"):
+    for private in ("E0001", "DEMO-COURSE-", "孟秋华", "郑思雨", "合成服务记录核查通过"):
         assert private not in published
     assert family.get("/oversight/sampling").status_code == 403
 
@@ -44,7 +44,7 @@ def test_sampling_publication_and_assessment_pages(application, password):
             assert batch["ReviewDistrict"] in shared and "验收检查结果" not in shared
 
             assessments = "/oversight/assessments"
-            assert "抽查示例机构" not in regulator.get(assessments).get_data(as_text=True)
+            assert "兰溪园养老服务站" not in regulator.get(assessments).get_data(as_text=True)
             assert submit(manager, assessments, operation="submit", period=form_month).status_code == 302
             record = one("""SELECT record.SubmissionId FROM dbo.AgencyAssessmentSubmission record
                           JOIN dbo.AppUser actor ON actor.AgencyId=record.AgencyId
@@ -54,7 +54,7 @@ def test_sampling_publication_and_assessment_pages(application, password):
                               note="验收考核意见")
             assert response.status_code == 302
             mine = manager.get(assessments).get_data(as_text=True)
-            assert "验收考核意见" in mine and "抽查示例机构" not in mine
+            assert "验收考核意见" in mine and "兰溪园养老服务站" not in mine
         finally:
             db.rollback()
 
